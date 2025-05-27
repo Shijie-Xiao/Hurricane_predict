@@ -2,6 +2,7 @@
 
 ## Project Structure
 
+```text
 Hurricane_predict/
 ├── configs/
 │ └── default.yaml
@@ -17,6 +18,7 @@ Hurricane_predict/
 ├── visualize.py
 ├── requirements.txt
 └── README.md
+```
 
 ## Prerequisites
 
