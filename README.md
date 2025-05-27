@@ -46,7 +46,7 @@ pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
 
 pip install -r requirements.txt
 ```
-##Configuration
+## Configuration
 
 ```bash
 python train.py --config configs/default.yaml --batch_size 8 --epochs 50
