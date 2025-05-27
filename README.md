@@ -52,7 +52,7 @@ pip install -r requirements.txt
 python train.py --config configs/default.yaml --batch_size 8 --epochs 50
 ```
 
-###train.py
+### train.py
 
 | Argument            | Type    | Default                        | Description                                    |
 | ------------------- | ------- | ------------------------------ | ---------------------------------------------- |
@@ -73,7 +73,7 @@ python train.py --config configs/default.yaml --batch_size 8 --epochs 50
 | `--device`          | `str`   | `None`                         | `cpu` or `cuda`                                |
 | `--checkpoint_path` | `str`   | `model/best_model.pth`         | Path to save best checkpoint                   |
 
-###visualize.py
+### visualize.py
 | Argument         | Type    | Default                | Description                                     |
 | ---------------- | ------- | ---------------------- | ----------------------------------------------- |
 | `--config`       | `str`   | `configs/default.yaml` | Path to YAML config file                        |
