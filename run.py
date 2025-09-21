@@ -5,8 +5,8 @@ Unified CLI entry for the hurricane genesis codebase.
 
 Subcommands:
   - prepare  : crop raw (90x180) to region (40x100), optional channel subset, optional ENSO split
-  - train    : multi-run Timesformer training on FULL dataset by default (no ENSO split)
-  - pcmci    : run PCMCI causal visualization with sensible defaults
+  - train    : multi-run Timesformer training; supports FULL or ENSO splits (NINO/NINA/NET)
+  - pcmci    : run PCMCI causal visualization
   - spatial  : quick spatial contour maps (for arrays or saliency)
   - shap     : placeholder
   - predict  : placeholder (U-Net)
@@ -20,7 +20,7 @@ from pathlib import Path
 # Local modules
 import utils
 import visualize
-import train as trainer  # ← now pointing to train.py
+import train as trainer  # train.py
 
 
 def cmd_prepare(args):
@@ -46,16 +46,32 @@ def cmd_prepare(args):
         print(f"  {k}: {v}")
 
 
-def cmd_train(args):
-    """Train Timesformer on FULL dataset by default (no ENSO split)."""
-    env  = args.env or "region_env.npy"
-    hurr = args.hurr or "region_hurr.npy"
+def _resolve_paths_for_split(use_split: str, env: str, hurr: str):
+    """If --use_split is set, map to X_<SPLIT>.npy / Y_<SPLIT>.npy, else keep passed paths."""
+    if not use_split:
+        return env, hurr, None
+    split = use_split.upper()
+    env_s, hurr_s = f"X_{split}.npy", f"Y_{split}.npy"
+    return env_s, hurr_s, split
 
+
+def cmd_train(args):
+    """Train Timesformer; supports FULL or ENSO splits."""
+    # If --use_split is provided, override env/hurr
+    env, hurr, split = _resolve_paths_for_split(args.use_split, args.env, args.hurr)
     print(f"[train] Using env={env}  hurr={hurr}")
+
+    # If out_root remains default, auto-append split/in_ch
+    out_root = args.out_root
+    if out_root == "runs_FULL_auto":
+        tag = split if split else "FULL"
+        ch  = args.in_ch if args.in_ch is not None else "auto"
+        out_root = f"runs_{tag}_{ch}"
+
     trainer.run_training(
         env_path=env,
         hurr_path=hurr,
-        out_root=args.out_root or "runs_FULL_auto",
+        out_root=out_root,
         runs=args.runs,
         epochs=args.epochs,
         lr=args.lr,
@@ -123,16 +139,18 @@ def build_parser():
     sp.add_argument("--lat1", type=int, default=85)
     sp.add_argument("--lon0", type=int, default=80)
     sp.add_argument("--lon1", type=int, default=180)
-    sp.add_argument("--in_ch", type=int, default=9, help="If 9, select default 9-channel subset; else use all channels.")
+    sp.add_argument("--in_ch", type=int, default=9, help="If 9, select default 9-channel subset; else keep all channels.")
     sp.add_argument("--split_enso", action="store_true", help="Also generate X_NINO/X_NINA/X_NET splits.")
     sp.add_argument("--th_nino", type=float, default=0.5)
     sp.add_argument("--th_nina", type=float, default=-0.5)
     sp.set_defaults(func=cmd_prepare)
 
     # train
-    sp = sub.add_parser("train", help="Train Timesformer (FULL dataset by default).")
+    sp = sub.add_parser("train", help="Train Timesformer (FULL by default; use --use_split to select NINO/NINA/NET).")
     sp.add_argument("--env", type=str, default="region_env.npy")
     sp.add_argument("--hurr", type=str, default="region_hurr.npy")
+    sp.add_argument("--use_split", type=str, choices=["NINO","NINA","NET"], default=None,
+                    help="If set, use X_<SPLIT>.npy / Y_<SPLIT>.npy instead of region_env/hurr.")
     sp.add_argument("--in_ch", type=int, default=None, help="If None, inferred from env last dim.")
     sp.add_argument("--seq_len", type=int, default=14)
     sp.add_argument("--stride",  type=int, default=3)
