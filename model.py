@@ -1,175 +1,122 @@
-# model.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+RevisedHierarchicalPatchTimesformer model definition.
+Kept minimal and framework-agnostic so it can be imported by training/visualization code.
+"""
 
 import torch
 import torch.nn as nn
-from scipy.optimize import linear_sum_assignment
-import numpy as np
-from transformers import TimesformerConfig, TimesformerModel
 
-class Matcher(nn.Module):
-    """
-    Perform matching between predicted points and ground-truth points
-    using the Hungarian algorithm.
-    """
-    @torch.no_grad()
-    def forward(self, preds, targets):
-        """
-        Args:
-          - preds: (B, T, Q, 2) predicted coordinates
-          - targets: list of B lists, each containing T tensors (n_t, 2)
-        Returns:
-          - indices: list of B lists, each containing T (pred_idx, tgt_idx) pairs
-        """
-        B, T, Q, _ = preds.shape
-        all_indices = []
-        for b in range(B):
-            frame_indices = []
-            for t in range(T):
-                p = preds[b, t].detach().cpu()     # (Q,2)
-                gt = targets[b][t].detach().cpu()  # (n_t,2)
-                if gt.numel() == 0:
-                    frame_indices.append((torch.empty(0, dtype=torch.int64),
-                                           torch.empty(0, dtype=torch.int64)))
-                else:
-                    cost = torch.cdist(p, gt, p=1).numpy()  # (Q, n_t)
-                    row_idx, col_idx = linear_sum_assignment(cost)
-                    frame_indices.append((
-                        torch.tensor(row_idx, dtype=torch.int64),
-                        torch.tensor(col_idx, dtype=torch.int64)
-                    ))
-            all_indices.append(frame_indices)
-        return all_indices
 
-class Criterion(nn.Module):
-    """
-    Compute classification and bounding-box regression loss.
-    """
-    def __init__(self, matcher, bbox_weight=5.0, cls_weight=1.0, noobj_coef=0.1):
+class FactorizedSTBlock(nn.Module):
+    """Factorized space-time attention block with MLP."""
+    def __init__(self, E, num_heads, mlp_ratio=4.0, drop=0.0):
         super().__init__()
-        self.matcher = matcher
-        self.bbox_weight = bbox_weight
-        self.cls_weight = cls_weight
-        self.noobj_coef = noobj_coef
-        self.l1_loss = nn.L1Loss(reduction='none')
-        self.ce_loss = nn.CrossEntropyLoss(reduction='none')
+        self.norm_sp = nn.LayerNorm(E)
+        self.attn_sp = nn.MultiheadAttention(E, num_heads, dropout=drop)
+        self.norm_tp = nn.LayerNorm(E)
+        self.attn_tp = nn.MultiheadAttention(E, num_heads, dropout=drop)
+        self.norm_mlp = nn.LayerNorm(E)
+        hid = int(E * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(E, hid),
+            nn.GELU(),
+            nn.Linear(hid, E),
+        )
 
-    def forward(self, logits, coords, targets):
-        """
-        Args:
-          - logits: (B, T, Q, 2) classification logits
-          - coords: (B, T, Q, 2) normalized bbox centers
-          - targets: list of B lists of T tensors (n_t, 2)
-        Returns:
-          - total loss (scalar)
-        """
-        B, T, Q, _ = coords.shape
-        device = coords.device
-        indices = self.matcher(coords, targets)
-        cls_losses = []
-        bbox_losses = []
+    def forward(self, x):
+        # x: (B, T, P, E)
+        B, T, Pn, E = x.shape
+        # spatial attention
+        sp = x.reshape(B*T, Pn, E).transpose(0, 1)  # (P, BT, E)
+        o_sp, _ = self.attn_sp(sp, sp, sp, need_weights=False)
+        o_sp = o_sp.transpose(0, 1).reshape(B, T, Pn, E)
+        x = x + self.norm_sp(o_sp)
+        # temporal attention
+        tp = x.permute(2, 0, 1, 3).reshape(Pn*B, T, E).transpose(0, 1)  # (T, PB, E)
+        o_tp, _ = self.attn_tp(tp, tp, tp, need_weights=False)
+        o_tp = o_tp.transpose(0, 1).reshape(Pn, B, T, E).permute(1, 2, 0, 3)
+        x = x + self.norm_tp(o_tp)
+        # mlp
+        x = x + self.mlp(self.norm_mlp(x))
+        return x
 
-        for b in range(B):
-            for t in range(T):
-                logit = logits[b, t]   # (Q,2)
-                coord = coords[b, t]   # (Q,2)
-                pred_idx, tgt_idx = indices[b][t]
 
-                # classification labels: 1 for object, 0 for background
-                labels = torch.zeros(Q, dtype=torch.long, device=device)
-                if len(pred_idx) > 0:
-                    labels[pred_idx] = 1
-
-                # classification loss
-                cls_loss = self.ce_loss(logit.view(-1, 2), labels)
-                cls_loss = cls_loss * torch.where(
-                    labels == 0,
-                    self.noobj_coef,
-                    torch.tensor(1.0, device=device)
-                )
-                cls_losses.append(cls_loss.mean())
-
-                # bbox regression loss for matched points
-                if len(pred_idx) > 0:
-                    p_coords = coord[pred_idx]
-                    gt_coords = targets[b][t][tgt_idx].to(device)
-                    box_loss = self.l1_loss(p_coords, gt_coords).sum(dim=1).mean()
-                    bbox_losses.append(box_loss)
-
-        loss_cls = torch.stack(cls_losses).mean() * self.cls_weight
-        loss_box = (torch.stack(bbox_losses).mean() * self.bbox_weight
-                    if bbox_losses else torch.tensor(0., device=device))
-        return loss_cls + loss_box
-
-class DETRModel(nn.Module):
-    """
-    DETR-based model with a 3D conv stem and TimeSformer encoder.
-    """
+class RevisedHierarchicalPatchTimesformer(nn.Module):
+    """Two-stage hierarchical patch Timesformer for patch-wise binary genesis prediction."""
     def __init__(self,
-                 in_channels=19,
-                 hidden_dim=256,
-                 num_layers=6,
-                 num_heads=8,
-                 num_queries=15,
-                 seq_len=24,
-                 img_size=90):
+                 seq_len=14,
+                 in_ch=9,
+                 H=40, W=100,
+                 small_patch_h=2, small_patch_w=2,
+                 patch_h=20, patch_w=20,
+                 embed_small=64,
+                 depth_small=2,
+                 embed_large=128,
+                 depth_large=4,
+                 num_heads=8):
         super().__init__()
         self.seq_len = seq_len
-        self.num_queries = num_queries
+        self.sh, self.sw = small_patch_h, small_patch_w
+        self.ph, self.pw = patch_h, patch_w
+        self.n_slat = H // small_patch_h
+        self.n_slon = W // small_patch_w
+        self.n_lat  = H // patch_h
+        self.n_lon  = W // patch_w
+        P_small = self.n_slat * self.n_slon
+        P_large = self.n_lat  * self.n_lon
 
-        # 3D convolutional backbone
-        self.stem = nn.Sequential(
-            nn.Conv3d(in_channels, hidden_dim//2, (3,3,3), (1,2,2), (1,1,1)),
-            nn.BatchNorm3d(hidden_dim//2),
-            nn.GELU(),
-            nn.Conv3d(hidden_dim//2, hidden_dim, (3,3,3), (1,2,2), (1,1,1)),
-            nn.BatchNorm3d(hidden_dim),
-            nn.GELU()
-        )
+        # small-level embedding
+        self.small_proj = nn.Linear(in_ch * self.sh * self.sw, embed_small)
+        self.pos_sp_small = nn.Parameter(torch.zeros(1, 1, P_small, embed_small))
+        self.pos_tp_small = nn.Parameter(torch.zeros(1, seq_len, 1, embed_small))
+        self.blocks_small = nn.ModuleList([FactorizedSTBlock(embed_small, num_heads) for _ in range(depth_small)])
+        self.norm_small   = nn.LayerNorm(embed_small)
 
-        # TimeSformer encoder
-        reduced = img_size // 4
-        cfg = TimesformerConfig(
-            image_size=reduced,
-            patch_size=16,
-            num_frames=seq_len,
-            num_channels=hidden_dim,
-            hidden_size=hidden_dim,
-            num_hidden_layers=num_layers,
-            num_attention_heads=num_heads,
-            intermediate_size=hidden_dim*4,
-            attention_type="divided_space_time"
-        )
-        self.encoder = TimesformerModel(cfg)
+        # large-level embedding (pooled from small)
+        self.skip_proj  = nn.Linear(embed_small, embed_large)
+        self.large_proj = nn.Linear(embed_small, embed_large)
+        self.pos_sp_large = nn.Parameter(torch.zeros(1, 1, P_large, embed_large))
+        self.pos_tp_large = nn.Parameter(torch.zeros(1, seq_len, 1, embed_large))
+        self.blocks_large = nn.ModuleList([FactorizedSTBlock(embed_large, num_heads) for _ in range(depth_large)])
+        self.norm_large   = nn.LayerNorm(embed_large)
 
-        # query embeddings + transformer decoder
-        self.query_embed = nn.Embedding(seq_len * num_queries, hidden_dim)
-        dec_layer = nn.TransformerDecoderLayer(d_model=hidden_dim, nhead=num_heads)
-        self.decoder = nn.TransformerDecoder(dec_layer, num_layers=num_layers)
+        # prediction head
+        self.head = nn.Linear(embed_large, 1)
 
-        # output heads
-        self.class_head = nn.Linear(hidden_dim, 2)
-        self.coord_head = nn.Linear(hidden_dim, 2)
+        # init
+        for p in [self.pos_sp_small, self.pos_tp_small, self.pos_sp_large, self.pos_tp_large]:
+            nn.init.trunc_normal_(p, std=0.02)
 
     def forward(self, x):
         """
-        Args:
-          - x: tensor of shape (B, T, H, W, C)
-        Returns:
-          - logits: (B, T, Q, 2)
-          - coords: (B, T, Q, 2) normalized in [0,1]
+        x: (B, T, C, H, W)
+        returns: logits (B, T, n_lat, n_lon)
         """
-        # reshape to (B, C, T, H, W)
-        x = x.permute(0,4,1,2,3)
-        features = self.stem(x)                   # (B, D, T, H/4, W/4)
-        feat = features.permute(0,2,1,3,4)        # (B, T, D, H', W')
-        enc = self.encoder(pixel_values=feat)
-        tokens = enc.last_hidden_state[:,1:]      # drop CLS token
-        memory = tokens.transpose(0,1)            # (P*T, B, D)
+        B, T, C, Hh, Ww = x.shape
+        # small patches
+        x_s = x.view(B, T, C, self.n_slat, self.sh, self.n_slon, self.sw)
+        x_s = x_s.permute(0, 1, 3, 5, 2, 4, 6).contiguous()
+        x_s = x_s.view(B, T, self.n_slat*self.n_slon, C*self.sh*self.sw)
 
-        q = self.query_embed.weight.unsqueeze(1).repeat(1, x.size(0), 1)
-        out = self.decoder(q, memory)             # (P*T, B, D)
-        out = out.transpose(0,1).view(x.size(0), self.seq_len,
-                                      self.num_queries, -1)
-        logits = self.class_head(out)
-        coords = torch.sigmoid(self.coord_head(out))
-        return logits, coords
+        z_s = self.small_proj(x_s)
+        z_s = z_s + self.pos_sp_small + self.pos_tp_small
+        for blk in self.blocks_small:
+            z_s = blk(z_s)
+        z_s = self.norm_small(z_s)
+
+        # pool small -> large patches
+        z_s2 = z_s.view(B, T, self.n_lat, self.ph//self.sh, self.n_lon, self.pw//self.sw, -1)
+        z_pooled = z_s2.mean(dim=5).mean(dim=3)  # average within each large patch
+        z_l_small = z_pooled.view(B, T, self.n_lat*self.n_lon, -1)
+
+        skip = self.skip_proj(z_l_small)
+        z_l  = self.large_proj(z_l_small) + skip
+        z_l  = z_l + self.pos_sp_large + self.pos_tp_large
+        for blk in self.blocks_large:
+            z_l = blk(z_l)
+        z_l = self.norm_large(z_l)
+
+        logits = self.head(z_l).squeeze(-1).view(B, T, self.n_lat, self.n_lon)
+        return logits

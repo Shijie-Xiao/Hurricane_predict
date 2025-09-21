@@ -92,7 +92,7 @@ Arguments:
 | `--env`         | `X_NINA.npy`  | Path to environment input |
 | `--hurr`        | `Y_NINA.npy`  | Path to hurricane labels |
 | `--out_root`    | `runs_NINA_9` | Root folder for run outputs |
-| `--runs`        | `10`          | Number of independent runs |
+| `--runs`        | `5`          | Number of independent runs |
 | `--epochs`      | `130`         | Training epochs per run |
 | `--lr`          | `1e-4`        | Learning rate |
 | `--weight_decay`| `1e-5`        | Weight decay |
