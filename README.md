@@ -1,4 +1,4 @@
-# Hurricane Genesis Modeling Codebase
+# Hurricane Genesis Prediction Codebase
 
 End-to-end, configurable codebase for **tropical cyclone genesis (TCG)** modeling, saliency, and causal inference.  
 Supports both **FULL dataset training (no ENSO split)** and **ENSO-split training on NINO/NINA/NET groups**,  
