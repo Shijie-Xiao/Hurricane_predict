@@ -1,9 +1,10 @@
---extra-index-url https://download.pytorch.org/whl/cu118
-torch==2.6.0
-torchvision==0.21.0
-torchaudio==2.6.0
 numpy
 scipy
-tqdm
-pyyaml
 matplotlib
+tqdm
+torch>=2.1
+scikit-learn
+basemap
+tigramite
+networkx
+pyyaml

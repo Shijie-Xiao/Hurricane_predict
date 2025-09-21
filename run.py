@@ -3,9 +3,9 @@
 """
 Unified CLI entry for the hurricane genesis codebase.
 
-This script provides the following subcommands:
-  - prepare  : crop raw (90x180) to region (40x100), optionally select channels, optionally split ENSO
-  - train    : multi-run Timesformer training + optional IG saliency (defaults to FULL dataset)
+Subcommands:
+  - prepare  : crop raw (90x180) to region (40x100), optional channel subset, optional ENSO split
+  - train    : multi-run Timesformer training on FULL dataset by default (no ENSO split)
   - pcmci    : run PCMCI causal visualization with sensible defaults
   - spatial  : quick spatial contour maps (for arrays or saliency)
   - shap     : placeholder
@@ -16,22 +16,18 @@ All commands have defaults so the script runs even without any external config.
 
 import argparse
 from pathlib import Path
-import sys
 
-# Local imports
+# Local modules
 import utils
 import visualize
-import train_9 as trainer
+import train as trainer  # ← now pointing to train.py
 
 
 def cmd_prepare(args):
-    """
-    Crop raw arrays to region and optionally select channels / split ENSO.
-    """
+    """Crop raw arrays to region and optionally select channels / split ENSO."""
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Prepare region arrays (and optionally ENSO split)
     result = utils.prepare_data(
         hurr_file=args.hurr_raw,
         env_file=args.env_raw,
@@ -51,34 +47,33 @@ def cmd_prepare(args):
 
 
 def cmd_train(args):
-    """
-    Train Timesformer on FULL dataset by default (no ENSO split).
-    """
-    env = args.env or "region_env.npy"
+    """Train Timesformer on FULL dataset by default (no ENSO split)."""
+    env  = args.env or "region_env.npy"
     hurr = args.hurr or "region_hurr.npy"
-    print(f"[train] Using env={env}  hurr={hurr}")
 
-    trainer.run_training_and_saliency(
+    print(f"[train] Using env={env}  hurr={hurr}")
+    trainer.run_training(
         env_path=env,
         hurr_path=hurr,
-        out_root=args.out_root or "runs_FULL_9",
+        out_root=args.out_root or "runs_FULL_auto",
         runs=args.runs,
         epochs=args.epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
         seed=args.seed,
-        no_saliency=args.no_saliency,
+        seq_len=args.seq_len,
+        stride=args.stride,
+        batch_size=args.batch_size,
+        in_ch=args.in_ch
     )
 
 
 def cmd_pcmci(args):
-    """
-    Run PCMCI causal visualization.
-    """
+    """Run PCMCI causal visualization."""
     visualize.pcmci_main(
         env_path=args.env or "region_env.npy",
         hurr_path=args.hurr or "region_hurr.npy",
-        saliency_dir=args.saliency_dir or "runs_FULL_9/run_01/maps_9Channels_3",
+        saliency_dir=args.saliency_dir or "runs_FULL_auto/run_01/maps_9Channels_3",
         sp_h=args.sp_h,
         sp_w=args.sp_w,
         th_sal=args.th_sal,
@@ -98,9 +93,7 @@ def cmd_pcmci(args):
 
 
 def cmd_spatial(args):
-    """
-    Quick spatial plot for a .npy array (2D or 2D after downsampling).
-    """
+    """Quick spatial plot for a .npy array (2D)."""
     visualize.spatial_main(
         array_path=args.array,
         title=args.title,
@@ -140,20 +133,23 @@ def build_parser():
     sp = sub.add_parser("train", help="Train Timesformer (FULL dataset by default).")
     sp.add_argument("--env", type=str, default="region_env.npy")
     sp.add_argument("--hurr", type=str, default="region_hurr.npy")
-    sp.add_argument("--out_root", type=str, default="runs_FULL_9")
-    sp.add_argument("--runs", type=int, default=10)
-    sp.add_argument("--epochs", type=int, default=130)
+    sp.add_argument("--in_ch", type=int, default=None, help="If None, inferred from env last dim.")
+    sp.add_argument("--seq_len", type=int, default=14)
+    sp.add_argument("--stride",  type=int, default=3)
+    sp.add_argument("--batch_size", type=int, default=8)
+    sp.add_argument("--out_root", type=str, default="runs_FULL_auto")
+    sp.add_argument("--runs", type=int, default=3)
+    sp.add_argument("--epochs", type=int, default=60)
     sp.add_argument("--lr", type=float, default=1e-4)
     sp.add_argument("--weight_decay", type=float, default=1e-5)
     sp.add_argument("--seed", type=int, default=1337)
-    sp.add_argument("--no_saliency", action="store_true")
     sp.set_defaults(func=cmd_train)
 
     # pcmci
     sp = sub.add_parser("pcmci", help="Run PCMCI causal visualization.")
     sp.add_argument("--env", type=str, default="region_env.npy")
     sp.add_argument("--hurr", type=str, default="region_hurr.npy")
-    sp.add_argument("--saliency_dir", type=str, default="runs_FULL_9/run_01/maps_9Channels_3")
+    sp.add_argument("--saliency_dir", type=str, default="runs_FULL_auto/run_01/maps_9Channels_3")
     sp.add_argument("--sp_h", type=int, default=2)
     sp.add_argument("--sp_w", type=int, default=2)
     sp.add_argument("--th_sal", type=float, default=0.75)

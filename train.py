@@ -1,158 +1,239 @@
-# train.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Generic trainer for RevisedHierarchicalPatchTimesformer.
+
+- Supports 9 or 28 input channels (or any C inferred from env data).
+- Defaults to training on FULL dataset (no ENSO split):
+    env=region_env.npy, hurr=region_hurr.npy
+- Patch-wise binary genesis prediction with BCEWithLogitsLoss.
+- Saves best checkpoint per run by validation F1.
+
+This script is self-contained (no external configs required).
+"""
 
 import argparse
-import os
-import random
+from pathlib import Path
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, random_split
-from utils import SequenceDataset, collate_fn
-from model import DETRModel, Matcher, Criterion
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+from tqdm.auto import tqdm
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Train DETRModel for storm location prediction"
-    )
-    # Data parameters
-    parser.add_argument("--env_path", type=str,
-                        default="data/env_data_normalized.npy",
-                        help="Path to input features (.npy)")
-    parser.add_argument("--labels_path", type=str,
-                        default="data/HURR_LOCS.npy",
-                        help="Path to labels/masks (.npy)")
-    parser.add_argument("--seq_len", type=int, default=24,
-                        help="Sequence length")
-    parser.add_argument("--stride", type=int, default=None,
-                        help="Stride for sliding window")
-    parser.add_argument("--batch_size", type=int, default=4,
-                        help="Batch size")
-    parser.add_argument("--val_split", type=float, default=0.2,
-                        help="Fraction of data for validation")
-    # Model parameters
-    parser.add_argument("--in_channels", type=int, default=19)
-    parser.add_argument("--hidden_dim", type=int, default=256)
-    parser.add_argument("--num_layers", type=int, default=6)
-    parser.add_argument("--num_heads", type=int, default=8)
-    parser.add_argument("--num_queries", type=int, default=15)
-    parser.add_argument("--img_size", type=int, default=90)
-    # Training parameters
-    parser.add_argument("--epochs", type=int, default=100,
-                        help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=1e-4,
-                        help="Learning rate")
-    parser.add_argument("--weight_decay", type=float, default=1e-5,
-                        help="Weight decay for optimizer")
-    parser.add_argument("--bbox_weight", type=float, default=5.0,
-                        help="Weight for bbox regression loss")
-    parser.add_argument("--cls_weight", type=float, default=1.0,
-                        help="Weight for classification loss")
-    parser.add_argument("--noobj_coef", type=float, default=0.1,
-                        help="Coefficient for no-object loss")
-    parser.add_argument("--pct_start", type=float, default=0.1,
-                        help="pct_start for OneCycleLR scheduler")
-    parser.add_argument("--seed", type=int, default=None,
-                        help="Random seed")
-    parser.add_argument("--device", type=str, default=None,
-                        help="Device: cpu or cuda")
-    parser.add_argument("--checkpoint_path", type=str,
-                        default="model/best_model.pth",
-                        help="Path to save best checkpoint")
-    return parser.parse_args()
+from model import RevisedHierarchicalPatchTimesformer
 
-def main():
-    args = parse_args()
 
-    # Reproducibility
-    if args.seed is not None:
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        torch.cuda.manual_seed_all(args.seed)
+# ----------------- Dataset -----------------
+class HurricanePatchDataset(Dataset):
+    """
+    Builds sequences and patch labels:
+      - Input x: (T, C, H, W)
+      - Label y: (T, n_lat_p, n_lon_p) where each patch is 1 if any genesis pixel exists
+    """
+    def __init__(self, env_path, hurr_path,
+                 seq_len=14, stride=3,
+                 in_ch=None,
+                 H=40, W=100, patch_h=20, patch_w=20):
+        env_all  = np.nan_to_num(np.load(env_path),  nan=0.0, posinf=0.0, neginf=0.0)  # (D,H,W,C)
+        hurr_all = np.nan_to_num(np.load(hurr_path), nan=0.0, posinf=0.0, neginf=0.0)  # (D,H,W)
+        assert env_all.ndim == 4 and hurr_all.ndim == 3, "Check shapes of env/hurr arrays."
 
-    # Device setup
-    device = torch.device(
-        args.device if args.device else
-        ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+        D, H0, W0, C = env_all.shape
+        assert (H0, W0) == (H, W), f"Expected ({H},{W}), got ({H0},{W0})"
+        if in_ch is None:
+            in_ch = C
+        assert C == in_ch, f"--in_ch={in_ch} but env has C={C}"
 
-    # Ensure checkpoint directory exists
-    os.makedirs(os.path.dirname(args.checkpoint_path), exist_ok=True)
+        self.env  = torch.from_numpy(env_all).float()   # (D,H,W,C)
+        self.hurr = torch.from_numpy(hurr_all).float()  # (D,H,W)
+        self.seq_len = seq_len
+        self.stride  = stride
+        self.in_ch   = in_ch
+        self.H, self.W = H, W
+        self.patch_h, self.patch_w = patch_h, patch_w
+        self.n_lat_p = H // patch_h
+        self.n_lon_p = W // patch_w
 
-    # Load dataset and split
-    dataset = SequenceDataset(args.env_path,
-                              args.labels_path,
-                              seq_len=args.seq_len,
-                              stride=args.stride)
-    total = len(dataset)
-    val_size = int(total * args.val_split)
-    train_size = total - val_size
-    train_ds, val_ds = random_split(dataset, [train_size, val_size])
-    train_loader = DataLoader(train_ds,
-                              batch_size=args.batch_size,
-                              shuffle=True,
-                              collate_fn=collate_fn)
-    val_loader = DataLoader(val_ds,
-                            batch_size=args.batch_size,
-                            shuffle=False,
-                            collate_fn=collate_fn)
+        # sequence starts; keep those that contain at least one positive frame
+        all_starts = list(range(0, D - seq_len + 1, stride))
+        keep = []
+        for s in all_starts:
+            window = self.hurr[s:s+seq_len].reshape(seq_len, -1).sum(dim=1)  # (T,)
+            if (window > 0).any():
+                keep.append(s)
+        if len(keep) == 0:
+            # allow empty; still produce sequences
+            keep = all_starts
+        self.starts = keep
 
-    # Build model, matcher, loss, optimizer, scheduler
-    model = DETRModel(in_channels=args.in_channels,
-                      hidden_dim=args.hidden_dim,
-                      num_layers=args.num_layers,
-                      num_heads=args.num_heads,
-                      num_queries=args.num_queries,
-                      seq_len=args.seq_len,
-                      img_size=args.img_size).to(device)
-    matcher = Matcher()
-    criterion = Criterion(matcher,
-                          bbox_weight=args.bbox_weight,
-                          cls_weight=args.cls_weight,
-                          noobj_coef=args.noobj_coef)
-    optimizer = torch.optim.AdamW(model.parameters(),
-                                  lr=args.lr,
-                                  weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=args.lr,
-        steps_per_epoch=len(train_loader),
-        epochs=args.epochs,
-        pct_start=args.pct_start
-    )
+    def __len__(self):
+        return len(self.starts)
 
-    best_val_loss = float("inf")
-    for epoch in range(1, args.epochs + 1):
-        # Training loop
-        model.train()
-        train_loss = 0.0
-        for env_seq, coords_seq in train_loader:
-            env_seq = env_seq.to(device)
-            logits, coords = model(env_seq)
-            loss = criterion(logits, coords, coords_seq)
-            optimizer.zero_grad()
+    def __getitem__(self, idx):
+        s = self.starts[idx]
+        x = self.env[s:s+self.seq_len].permute(0, 3, 1, 2)  # (T,C,H,W)
+        h = self.hurr[s:s+self.seq_len]                     # (T,H,W)
+
+        # binarize per (20x20) patch
+        T = self.seq_len
+        ph, pw = self.patch_h, self.patch_w
+        nlp, nmp = self.n_lat_p, self.n_lon_p
+        h_patches = (h.reshape(T, nlp, ph, nmp, pw).permute(0,1,3,2,4))  # (T, nlp, nmp, ph, pw)
+        y = (h_patches.reshape(T, nlp, nmp, ph*pw).sum(dim=-1) > 0).long()  # (T, nlp, nmp)
+        return x, y
+
+
+# ----------------- Metrics -----------------
+def acc_pr_re_f1(y_true, y_pred):
+    """Compute accuracy, precision, recall, F1 for 0/1 arrays."""
+    tp = int(((y_true==1)&(y_pred==1)).sum())
+    fp = int(((y_true==0)&(y_pred==1)).sum())
+    fn = int(((y_true==1)&(y_pred==0)).sum())
+    tn = int(((y_true==0)&(y_pred==0)).sum())
+    acc  = (tp+tn)/max(1,(tp+tn+fp+fn))
+    prec = tp/max(1,(tp+fp))
+    rec  = tp/max(1,(tp+fn))
+    f1   = 0.0 if (prec+rec)==0 else 2*prec*rec/(prec+rec)
+    return acc,prec,rec,f1
+
+
+# ----------------- One-run training -----------------
+def train_one_run(run_dir, device, ds, seq_len, in_ch, H, W, patch_h, patch_w,
+                  epochs=130, batch_size=8, lr=1e-4, weight_decay=1e-5, seed=1337):
+    """Train a single run and save the best checkpoint by validation F1."""
+    # split
+    n_total = len(ds)
+    n_train = max(1, int(n_total*0.9))
+    n_val   = max(1, n_total - n_train)
+    train_ds, val_ds = random_split(ds, [n_train, n_val], generator=torch.Generator().manual_seed(seed))
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, drop_last=False)
+
+    # model
+    model = RevisedHierarchicalPatchTimesformer(
+        seq_len=seq_len, in_ch=in_ch, H=H, W=W,
+        small_patch_h=2, small_patch_w=2,
+        patch_h=patch_h, patch_w=patch_w,
+        embed_small=64, depth_small=2,
+        embed_large=128, depth_large=4,
+        num_heads=8
+    ).to(device)
+
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    crit = nn.BCEWithLogitsLoss()
+
+    best_f1 = 0.0
+    best_ckpt = run_dir / "best_patch_timesformer.pt"
+
+    for ep in range(1, epochs+1):
+        # train
+        model.train(); tr_loss, ytr, ypr = 0.0, [], []
+        for x, y in tqdm(train_loader, desc=f"[Train] Ep{ep}", leave=False):
+            x = x.to(device)
+            y = y.to(device).float()  # (B,T,nlat,nlon)
+
+            logits = model(x)                 # (B,T,nlat,nlon)
+            loss   = crit(logits, y)
+
+            opt.zero_grad()
             loss.backward()
-            optimizer.step()
-            scheduler.step()
-            train_loss += loss.item()
-        avg_train = train_loss / len(train_loader)
+            opt.step()
 
-        # Validation loop
-        model.eval()
-        val_loss = 0.0
+            tr_loss += loss.item()*x.size(0)
+            preds = (torch.sigmoid(logits)>0.5).long().cpu().view(-1).numpy()
+            ypr.extend(preds); ytr.extend(y.cpu().view(-1).numpy())
+
+        tr_acc,tr_pre,tr_rec,tr_f1 = acc_pr_re_f1(np.array(ytr), np.array(ypr))
+
+        # val
+        model.eval(); va_loss, yva, ypv = 0.0, [], []
         with torch.no_grad():
-            for env_seq, coords_seq in val_loader:
-                env_seq = env_seq.to(device)
-                logits, coords = model(env_seq)
-                val_loss += criterion(logits, coords, coords_seq).item()
-        avg_val = val_loss / len(val_loader)
+            for x, y in tqdm(val_loader, desc=f"[ Val ] Ep{ep}", leave=False):
+                x = x.to(device); y = y.to(device).float()
+                logits = model(x)
+                loss   = crit(logits, y)
+                va_loss += loss.item()*x.size(0)
+                preds = (torch.sigmoid(logits)>0.5).long().cpu().view(-1).numpy()
+                ypv.extend(preds); yva.extend(y.cpu().view(-1).numpy())
 
-        print(f"Epoch {epoch:03d} | Train Loss: {avg_train:.4f} | Val Loss: {avg_val:.4f}")
+        va_acc,va_pre,va_rec,va_f1 = acc_pr_re_f1(np.array(yva), np.array(ypv))
+        print(f"Ep{ep:03d} | TrLoss {tr_loss/len(train_ds):.4f} F1 {tr_f1:.4f} | "
+              f"VaLoss {va_loss/len(val_ds):.4f} F1 {va_f1:.4f}")
 
-        # Save best checkpoint
-        if avg_val < best_val_loss:
-            best_val_loss = avg_val
-            torch.save(model.state_dict(), args.checkpoint_path)
-            print(f"Saved best model to {args.checkpoint_path} (val_loss={best_val_loss:.4f})")
+        if va_f1 > best_f1:
+            best_f1 = va_f1
+            torch.save(model.state_dict(), best_ckpt)
+            print(f"  -> Saved best: {best_ckpt} (F1={va_f1:.4f})")
+
+    return best_ckpt, best_f1
+
+
+# ----------------- Multi-run wrapper (for run.py) -----------------
+def run_training(env_path="region_env.npy",
+                 hurr_path="region_hurr.npy",
+                 out_root="runs_FULL_auto",
+                 runs=3, epochs=60, lr=1e-4, weight_decay=1e-5, seed=1337,
+                 seq_len=14, stride=3, batch_size=8, in_ch=None):
+    """Convenience entry callable by run.py with explicit arguments."""
+    env = np.load(env_path)
+    T, H, W, C = env.shape
+    if in_ch is None:
+        in_ch = C
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[run_training] Device: {device} | Env C={C} | Using in_ch={in_ch}")
+
+    ds = HurricanePatchDataset(
+        env_path=env_path, hurr_path=hurr_path,
+        seq_len=seq_len, stride=stride,
+        in_ch=in_ch, H=H, W=W, patch_h=20, patch_w=20
+    )
+
+    out_root = Path(out_root); out_root.mkdir(parents=True, exist_ok=True)
+    bests = []
+    for r in range(1, runs+1):
+        torch.manual_seed(seed + r)
+        np.random.seed(seed + r)
+
+        run_dir = out_root / f"run_{r:02d}"; run_dir.mkdir(parents=True, exist_ok=True)
+        ckpt, f1 = train_one_run(
+            run_dir, device, ds, seq_len, in_ch, H, W, 20, 20,
+            epochs=epochs, batch_size=batch_size, lr=lr,
+            weight_decay=weight_decay, seed=seed + r
+        )
+        bests.append((str(ckpt), f1))
+
+    print("\n[run_training] Best checkpoints:")
+    for p, f1 in bests:
+        print(f" - {p} | F1={f1:.4f}")
+
+
+# ----------------- CLI main -----------------
+def main():
+    ap = argparse.ArgumentParser(description="Train Timesformer on FULL dataset (no ENSO split by default).")
+    ap.add_argument("--env", type=str, default="region_env.npy", help="Path to env array (T,40,100,C)")
+    ap.add_argument("--hurr", type=str, default="region_hurr.npy", help="Path to hurr mask (T,40,100)")
+    ap.add_argument("--in_ch", type=int, default=None, help="If None, inferred from env last dim")
+    ap.add_argument("--seq_len", type=int, default=14)
+    ap.add_argument("--stride",  type=int, default=3)
+    ap.add_argument("--runs",    type=int, default=3)
+    ap.add_argument("--epochs",  type=int, default=60)
+    ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--lr",      type=float, default=1e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-5)
+    ap.add_argument("--seed",    type=int, default=1337)
+    ap.add_argument("--out_root", type=str, default="runs_FULL_auto")
+    args = ap.parse_args()
+
+    run_training(
+        env_path=args.env, hurr_path=args.hurr, out_root=args.out_root,
+        runs=args.runs, epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
+        seed=args.seed, seq_len=args.seq_len, stride=args.stride,
+        batch_size=args.batch_size, in_ch=args.in_ch
+    )
+
 
 if __name__ == "__main__":
     main()
