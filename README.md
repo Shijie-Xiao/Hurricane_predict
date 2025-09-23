@@ -39,17 +39,41 @@ pip install -r requirements.txt
 
 ## Data Format
 
-- **Raw inputs (full grid 90×180)**:
-  - `HURR_LOC_DAILY.npy` → shape `(T, 90, 180)` (hurricane occurrence mask)
-  - `X_28.npy`           → shape `(T, 90, 180, C)` (environmental variables, usually `C=28`)
+### Raw Data
 
-- **Prepared region (North Atlantic 40×100)** after `prepare`:
-  - `region_hurr.npy` `(T, 40, 100)`
-  - `region_env.npy`  `(T, 40, 100, Csel)` where `Csel=9` (default subset) or `28`
-  - Optional **ENSO splits**:  
-    `X_NINO.npy`, `Y_NINO.npy`, `X_NINA.npy`, `Y_NINA.npy`, `X_NET.npy`, `Y_NET.npy`
+- **Source**:  
+  The data is derived from **ERA5 reanalysis** provided by **ECMWF (European Centre for Medium-Range Weather Forecasts)**, accessible through the **Copernicus Climate Data Store (CDS)**.  
+  - ERA5 provides hourly and daily reanalysis of the global climate system.  
+  - Download link: [CDS Portal](https://cds.climate.copernicus.eu/).  
+
+- **License**:  
+  ERA5 data is distributed under the **Copernicus License**, which permits free use provided attribution is given:  
+  > *“We acknowledge the use of ERA5 data from the Copernicus Climate Change Service (C3S).”*
+
+- **Raw input files**:
+  - `HURR_LOC_DAILY.npy` → shape `(T, 90, 180)`  
+    Daily hurricane occurrence mask (derived from IBTrACS or a tracking algorithm).  
+  - `X_28.npy` → shape `(T, 90, 180, C)`  
+    ERA5-derived environmental variables (e.g., Potential Intensity, SST, shear, vorticity, humidity, etc.), with `C=28` channels.  
+
+### Prepared Data (after `prepare`)
+
+- `region_hurr.npy` `(T, 40, 100)`  
+  Cropped hurricane mask (North Atlantic).  
+
+- `region_env.npy` `(T, 40, 100, Csel)`  
+  Cropped environmental variables. `Csel=9` (default subset) or `28`.  
+
+
+- **ENSO splits** (optional, by daily mean ENSO index in the cropped region):  
+  - `X_NINO.npy`, `Y_NINO.npy`  
+  - `X_NINA.npy`, `Y_NINA.npy`  
+  - `X_NET.npy`,  `Y_NET.npy`  
+
+Default thresholds: `≥ +0.5 → NINO`, `≤ -0.5 → NINA`, otherwise NET.
 
 ---
+
 
 ## Quick Start Workflows
 
@@ -142,27 +166,71 @@ Options:
 
 ## File Overview
 
-- **run.py**: Main CLI. Handles subcommands `prepare`, `train`, `pcmci`, `spatial`. Routes to other modules.  
-  - Key flags: `--use_split`, `--in_ch`, `--out_root`, etc.
+- **`run.py`**  
+  - **Function**: Main CLI, handling subcommands `prepare`, `train`, `pcmci`, `spatial`.  
+  - **Implementation**: Uses argparse subparsers to dispatch commands to `utils.prepare_data`, `train.run_training`, `visualize.pcmci_main`, and `visualize.spatial_main`.  
+  - **Usage**:  
+    ```bash
+    python run.py prepare --split_enso
+    python run.py train --in_ch 9 --out_root runs_FULL_9
+    python run.py pcmci --env X_NET.npy --hurr Y_NET.npy
+    python run.py spatial --array some_array.npy
+    ```  
+  - **Key arguments**: `--use_split`, `--in_ch`, `--out_root`.
 
-- **train.py**: Training loop for `RevisedHierarchicalPatchTimesformer`.  
-  - Loads env/hurr `.npy`, builds patch labels, trains with BCE loss.  
-  - Options: `--seq_len`, `--stride`, `--batch_size`, `--epochs`, `--lr`, etc.
+- **`train.py`**  
+  - **Function**: Training loop for `RevisedHierarchicalPatchTimesformer`. Supports 9 or 28 channels.  
+  - **Implementation**:  
+    - Defines `HurricanePatchDataset`: creates `(seq_len, C, H, W)` input and `(seq_len, n_lat, n_lon)` labels.  
+    - `train_one_run`: single-run training loop with BCEWithLogitsLoss.  
+    - `run_training`: multiple runs (default 3), saves best checkpoint by validation F1.  
+  - **Usage**:  
+    ```bash
+    python run.py train --in_ch 9
+    python run.py train --use_split NINA --in_ch 28
+    ```  
+  - **Key parameters**: `--seq_len`, `--stride`, `--batch_size`, `--epochs`, `--lr`, `--runs`.
 
-- **model.py**: Defines hierarchical patch Timesformer:  
-  - Small patch embeddings → pooled into large patches → transformer layers → patch-level logits.
+- **`model.py`**  
+  - **Function**: Defines hierarchical patch Timesformer.  
+  - **Components**:  
+    - `FactorizedSTBlock`: factorized space-time attention + MLP.  
+    - `RevisedHierarchicalPatchTimesformer`: two-stage (small patch → large patch) transformer with patch-level logits.  
+  - **Usage**:  
+    ```python
+    from model import RevisedHierarchicalPatchTimesformer
+    model = RevisedHierarchicalPatchTimesformer(seq_len=14, in_ch=9)
+    logits = model(x)  # (B,T,n_lat,n_lon)
+    ```
 
-- **visualize.py**: Two main utilities:  
-  - `spatial_main`: quick contour map for any 2D `.npy` array.  
-  - `pcmci_main`: full PCMCI pipeline (PCA features, pre-genesis mask, correlation pre-screen, causal graph plotting).
+- **`visualize.py`**  
+  - **Function**: Visualization tools for spatial maps and PCMCI causal graphs.  
+  - **Components**:  
+    - `spatial_main`: quick contour plotting for any 2D `.npy` array.  
+    - `pcmci_main`: builds PCA1 features, applies pre-genesis masking, runs PCMCI, and draws graphs (loose vs strict thresholds).  
+  - **Usage**:  
+    ```bash
+    python run.py spatial --array global_saliency.npy --title "Saliency"
+    python run.py pcmci --env X_NET.npy --hurr Y_NET.npy
+    ```
 
-- **utils.py**:  
-  - `prepare_data`: crop raw `(90,180)` → `(40,100)`, optional channel subset, optional ENSO split.  
-  - Channel name tables (28-channel, 9-channel subset).  
-  - Simple geo grid helpers.
+- **`utils.py`**  
+  - **Function**: Data preparation and helper utilities.  
+  - **Components**:  
+    - `prepare_data`: crops `(90,180)` → `(40,100)`, optional 9-channel subset, optional ENSO split.  
+    - Channel name tables: 28-channel full list, 9-channel default subset.  
+    - `geo_bounds_and_grid`: generates geographic grid for plotting.  
+  - **Usage**:  
+    ```python
+    import utils
+    result = utils.prepare_data("HURR_LOC_DAILY.npy", "X_28.npy", out_dir=".")
+    ```
 
-- **requirements.txt**: pip package list.  
-- **environment.yml**: Conda environment (recommended).
+- **`requirements.txt`**  
+  - Pip package dependencies (numpy, torch, matplotlib, tigramite, basemap, etc.).  
+
+- **`environment.yml`**  
+  - Conda environment specification (recommended for stable Basemap/Tigramite installation).
 
 ---
 
