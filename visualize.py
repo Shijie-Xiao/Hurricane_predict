@@ -2,52 +2,89 @@
 # -*- coding: utf-8 -*-
 """
 Visualization utilities:
-  - spatial_main : quick spatial contour from a .npy array
-  - pcmci_main   : PCMCI causal graph with pre-genesis masking and dual alpha thresholds
-
-All arguments have sensible defaults so this module can run without external configs.
-
-Examples
---------
-# 1) Spatial: draw contours for a 2D array (e.g., a saved global_saliency.npy)
-python visualize.py --task spatial --array path/to/global_saliency.npy
-
-# 2) PCMCI: run full pipeline on region arrays (no ENSO split by default)
-python visualize.py --task pcmci --env region_env.npy --hurr region_hurr.npy
+  - spatial_main           : quick spatial contour from a .npy array
+  - pcmci_main             : PCMCI causal graph with pre-genesis masking and dual alpha thresholds
+  - compute_and_save_saliency : Integrated Gradients saliency maps (global + per-patch) for all channels
+  - saliency_entrypoint    : build a minimal val loader and run saliency (for run.py spatial integration)
 """
 
 import os
 import re
-import argparse
 from pathlib import Path
 import numpy as np
-
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
-from matplotlib.cm import get_cmap, ScalarMappable
-import matplotlib.patheffects as pe
+from matplotlib.cm import get_cmap
 import networkx as nx
 
-from scipy.ndimage import gaussian_filter
-
-# Tigramite
 from tigramite import data_processing as pp
 from tigramite.pcmci import PCMCI
 from tigramite.independence_tests.parcorr import ParCorr
 
-# Basemap (optional but preferred)
-try:
-    from mpl_toolkits.basemap import Basemap
-    HAS_BASEMAP = True
-except Exception:
-    HAS_BASEMAP = False
+from scipy.ndimage import gaussian_filter
+from mpl_toolkits.basemap import Basemap
+
+import torch
+from torch.utils.data import DataLoader, random_split
 
 import utils
 
+# ---------------- Config defaults for saliency ----------------
+IG_STEPS = 20
+DOWNSAMPLE_FACTOR = 2
 
-# ---------- Spatial quick plot ----------
+# Channel name lists (use these instead of utils defaults for saliency naming)
+CHANNEL_NAMES_9 = [
+    "Potential Intensity",
+    "Specific Humidity (850mb)",
+    "Vertical Shear",
+    "Relative Vorticity (500mb)",
+    "Relative Vorticity (850mb)",
+    "Saturation Deficit (500mb)",
+    "Surface Radiation",
+    "Cloud Cover (500mb)",
+    "Ocean Heat Content",
+]
+
+CHANNEL_NAMES_28 = [
+    "1000 cloud cover","1000 Geopotential","1000 Vorticity (relative)","1000 Specific humidity",
+    "850 cloud cover","850 Geopotential","850 Vorticity (relative)","850 Specific humidity",
+    "850 Temperature","500 cloud cover","500 Vorticity (relative)","Vertical Shear",
+    "Potential Intensity","Sea surface temperature","Surface pressure","Charnock (Wave Drag)",
+    "Surface radiation","Convective precipitation","Total column rain water","500 Divergence",
+    "850 Divergence","1000 Divergence","ENSO","MJO","Salinity","OHC",
+    "850 Saturation Deficit","500 Saturation Deficit"
+]
+
+
+# ============================================================
+# =============== Quick Spatial Contour (2D) =================
+# ============================================================
+def _save_contour(fig_path: str,
+                  data_ds: np.ndarray,
+                  title: str,
+                  geo_bounds,
+                  grids,
+                  levels):
+    """Save a contour figure with Basemap."""
+    fig, ax = plt.subplots(figsize=(6, 4), dpi=200)
+    m = Basemap(projection='cyl',
+                llcrnrlat=geo_bounds[0], urcrnrlat=geo_bounds[1],
+                llcrnrlon=geo_bounds[2], urcrnrlon=geo_bounds[3],
+                resolution='i', ax=ax)
+    ax.set_facecolor('white')
+    m.drawcoastlines(color='black', linewidth=0.3, zorder=2)
+    cf = m.contourf(grids[0], grids[1], data_ds, levels=levels,
+                    cmap='RdBu_r', extend='both', alpha=0.9, zorder=1)
+    ax.set_title(title, fontsize=12)
+    ax.axis('off')
+    fig.colorbar(cf, ax=ax, orientation='vertical', fraction=0.04, pad=0.02)
+    fig.savefig(fig_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+
 def spatial_main(array_path: str,
                  title: str = "Spatial Map",
                  vmin: float = -1.0,
@@ -56,14 +93,10 @@ def spatial_main(array_path: str,
                  out_path: str = "spatial.png",
                  lat0: int = 45, lat1: int = 85, lon0: int = 80, lon1: int = 180,
                  downsample: int = 2):
-    """Draw a quick spatial contour map for a 2D npy array."""
+    """Plot a 2D .npy array as a quick contour map."""
     arr = np.load(array_path)
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D array, got shape {arr.shape}")
-
-    # optional pre-smoothing to avoid salt-and-pepper visualization
-    arr = gaussian_filter(arr.astype(float), sigma=0.8)
-
     ds = arr[::downsample, ::downsample]
     levels = np.linspace(vmin, vmax, steps)
 
@@ -71,31 +104,21 @@ def spatial_main(array_path: str,
     W = lon1 - lon0
     bounds, grids = utils.geo_bounds_and_grid(H, W, region_lat0=lat0, region_lon0=lon0, ds_factor=downsample)
 
-    fig, ax = plt.subplots(figsize=(6, 4), dpi=220)
-    if HAS_BASEMAP:
-        m = Basemap(projection='cyl',
-                    llcrnrlat=bounds[0], urcrnrlat=bounds[1],
-                    llcrnrlon=bounds[2], urcrnrlon=bounds[3],
-                    resolution='l', ax=ax)
-        ax.set_facecolor('white')
-        m.drawcoastlines(color='black', linewidth=0.3, zorder=2)
-        cf = m.contourf(grids[0], grids[1], ds, levels=levels, cmap='RdBu_r', extend='both', alpha=0.95, zorder=1)
-    else:
-        X, Y = grids
-        cf = ax.contourf(X, Y, ds, levels=levels, cmap='RdBu_r', extend='both', alpha=0.95)
-
-    ax.set_title(title, fontsize=12)
-    ax.axis('off')
-    fig.colorbar(cf, ax=ax, orientation='vertical', fraction=0.04, pad=0.02)
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=300, bbox_inches='tight')
-    plt.close(fig)
+    _save_contour(
+        fig_path=out_path,
+        data_ds=ds,
+        title=title,
+        geo_bounds=bounds,
+        grids=grids,
+        levels=levels
+    )
     print(f"[spatial] Saved -> {out_path}")
 
 
-# ---------- PCMCI helpers ----------
+# ============================================================
+# ======================= PCMCI Utils ========================
+# ============================================================
 def _fast_crosscorr(x, y, lag):
-    """NaN-safe corr(x_t, y_{t-lag}), lag>=1."""
     if lag >= len(x):
         return 0.0
     a = x[lag:]; b = y[:-lag]
@@ -108,7 +131,6 @@ def _fast_crosscorr(x, y, lag):
 
 
 def _prescreen_links(X, r0, tau_max):
-    """For each target j, collect parents (i,-lag) with |corr|>=r0."""
     K = X.shape[1]
     sel = {j: [] for j in range(K)}
     for j in range(K):
@@ -161,24 +183,9 @@ def _max_abs_autocorr(x, tau_max=5):
     return float(np.nanmax(np.abs(vals))) if len(vals)>0 else 0.0
 
 
-def _wrap_label(text: str, max_line_len=12):
-    words = text.split(); lines, cur = [], ""
-    for w in words:
-        if len(cur) + (1 if cur else 0) + len(w) <= max_line_len:
-            cur = f"{cur} {w}".strip()
-        else:
-            lines.append(cur); cur = w
-    if cur: lines.append(cur)
-    return "\n".join(lines)
-
-
-def _soften(color_rgba, amt=0.55, alpha=0.98):
-    rgb = np.array(color_rgba[:3])
-    rgb_soft = 1.0 - amt * (1.0 - rgb)
-    return (rgb_soft[0], rgb_soft[1], rgb_soft[2], alpha)
-
-
-# ---------- PCMCI main ----------
+# ============================================================
+# ======================= PCMCI Main =========================
+# ============================================================
 def pcmci_main(env_path="region_env.npy",
                hurr_path="region_hurr.npy",
                saliency_dir="runs_FULL_9/run_01/maps_9Channels_3",
@@ -189,10 +196,7 @@ def pcmci_main(env_path="region_env.npy",
                alpha_loose=0.05, alpha_strict=0.0001, min_abs=0.05,
                max_conds_dim=2, max_combinations=100000,
                fig_prefix="PCMCI_PRE7MASK"):
-    """
-    PCMCI pipeline with pre-genesis masking and dual alpha visualization.
-    If 'saliency_dir' doesn't exist, PCA1 is computed on all patches (no saliency filtering).
-    """
+    """Minimal, configurable PCMCI pipeline."""
     # Load data
     env = np.load(env_path)    # (T,40,100,C)
     hurr = np.load(hurr_path)  # (T,40,100)
@@ -200,70 +204,46 @@ def pcmci_main(env_path="region_env.npy",
     n_lat_p = H // sp_h
     n_lon_p = W // sp_w
 
-    # Channel names for labeling; fall back to generic
-    channel_names = utils.DEFAULT_SELECTED_9
-    if len(channel_names) != C:
-        channel_names = [f"Var{c}" for c in range(C)]
+    # Channel names
+    channel_names = utils.DEFAULT_SELECTED_9 if C == 9 else [f"Var{c}" for c in range(C)]
 
-    # -------- Build per-channel PCA1 features (optionally saliency-guided) --------
-    pcs_daily, kept_names, notes = [], [], []
-    use_saliency = saliency_dir and os.path.isdir(saliency_dir)
+    # Build per-channel PCA1 features guided by saliency
+    pcs_daily = []
+    kept_names = []
 
     for ch_idx, name in enumerate(channel_names):
+        safe = re.sub(r"[^\w_]", "_", name)
+        sal_path = os.path.join(saliency_dir, safe, "global_saliency.npy")
+        if not os.path.exists(sal_path):
+            raise FileNotFoundError(f"Missing saliency for {name}: {sal_path}")
+
+        sal_map = np.load(sal_path)  # expected (20,50) after downsampling
+        mask_cells = (sal_map > th_sal).ravel()
+        n_sel = int(mask_cells.sum()); used = "th"
+        if n_sel < 3:
+            thr = np.quantile(sal_map.ravel(), fallback_topq)
+            mask_cells = (sal_map.ravel() >= thr)
+            n_sel = int(mask_cells.sum()); used=f"top{int((1-fallback_topq)*100)}%"
+        if n_sel < 3:
+            idx_sorted = np.argsort(sal_map.ravel())[::-1]
+            mask_cells = np.zeros_like(sal_map.ravel(), bool); mask_cells[idx_sorted[:3]] = True
+            n_sel = 3; used="top3-cells"
+
         arr = env[..., ch_idx]  # (T,H,W)
-        arr_patch = arr.reshape(T, n_lat_p, sp_h, n_lon_p, sp_w).mean(axis=(2,4))  # (T, 20, 50)
-        flat = arr_patch.reshape(T, -1)                                            # (T, 1000)
-
-        if use_saliency:
-            safe = re.sub(r"[^\w_]", "_", name)
-            sal_path = os.path.join(saliency_dir, safe, "global_saliency.npy")
-            if not os.path.exists(sal_path):
-                # Fallback to no-saliency for this channel
-                sel_mask = np.ones(flat.shape[1], dtype=bool)
-                used = "no-saliency"
-            else:
-                sal_map = np.load(sal_path).astype(float)  # expect (20,50)
-                if sal_map.shape != (n_lat_p, n_lon_p):
-                    # Attempt rough resize if shapes mismatch
-                    sal_map = sal_map
-                mask_cells = (sal_map > th_sal).ravel()
-                n_sel = int(mask_cells.sum()); used = "th"
-                if n_sel < 3:
-                    thr = np.quantile(sal_map.ravel(), fallback_topq)
-                    mask_cells = (sal_map.ravel() >= thr)
-                    n_sel = int(mask_cells.sum()); used=f"top{int((1-fallback_topq)*100)}%"
-                if n_sel < 3:
-                    idx_sorted = np.argsort(sal_map.ravel())[::-1]
-                    mask_cells = np.zeros_like(sal_map.ravel(), bool); mask_cells[idx_sorted[:3]] = True
-                    n_sel = 3; used="top3-cells"
-                sel_mask = mask_cells
-        else:
-            sel_mask = np.ones(flat.shape[1], dtype=bool)
-            used = "no-saliency"
-
-        sel = flat[:, sel_mask]                                    # (T, n_sel)
+        arr_patch = arr.reshape(T, n_lat_p, sp_h, n_lon_p, sp_w).mean(axis=(2,4))
+        sel = arr_patch.reshape(T, -1)[:, mask_cells]  # (T,n_sel)
         sel_z = (sel - sel.mean(0)) / (sel.std(0) + 1e-12)
 
-        # PCA1 per channel
+        # PCA1
         from sklearn.decomposition import PCA
         pca = PCA(n_components=1, random_state=0)
-        pc1 = pca.fit_transform(sel_z).ravel().astype('float32')
-        evr = float(pca.explained_variance_ratio_[0])
-        if evr < min_exp:
-            pc1 = sel.mean(axis=1).astype('float32')
-            used += f" | fallback=mean(ev={evr:.3f})"
-        else:
-            used += f" | PCA1(ev={evr:.3f})"
-
-        pcs_daily.append(pc1)
+        pc1 = pca.fit_transform(sel_z).ravel()
+        pcs_daily.append(pc1.astype('float32'))
         kept_names.append(name)
-        notes.append((name, used, int(sel_mask.sum())))
 
-    X_raw = np.stack(pcs_daily, axis=1).astype('float32')  # (T, K)
-
-    # -------- Pre-genesis time mask (union of the last 'pre_days' before each genesis) --------
+    # === Pre-genesis mask (last `pre_days` prior to each genesis) ===
     rh = np.where(np.isfinite(hurr), hurr, 0.0)
-    genesis_days = (rh.reshape(T, -1).max(axis=1) > 0).astype(bool)
+    genesis_days = (rh.reshape(T,-1).max(axis=1) > 0).astype(bool)
     mask_time = np.zeros(T, dtype=bool)
     g_idx = np.where(genesis_days)[0]
     for t in g_idx:
@@ -271,215 +251,410 @@ def pcmci_main(env_path="region_env.npy",
         if start < t:
             mask_time[start:t] = True
 
-    # Standardize within mask; outside becomes NaN
-    mu  = np.nanmean(np.where(mask_time[:, None], X_raw, np.nan), axis=0)
-    std = np.nanstd (np.where(mask_time[:, None], X_raw, np.nan), axis=0) + 1e-12
+    # Standardize within mask
+    X_raw = np.stack(pcs_daily, axis=1).astype('float32')  # (T,C)
+    mu  = np.nanmean(np.where(mask_time[:,None], X_raw, np.nan), axis=0)
+    std = np.nanstd (np.where(mask_time[:,None], X_raw, np.nan), axis=0) + 1e-12
     X_std = (X_raw - mu) / std
     X_daily = X_std.copy()
     X_daily[~mask_time, :] = np.nan
     var_names = kept_names
 
-    print(f"[pcmci] variables: {var_names}")
-    print(f"[pcmci] mask days kept={int(mask_time.sum())}/{T} ({100.0*mask_time.mean():.1f}%)")
-    for n, u, ns in notes:
-        print(f" - {n}: {u}, n_sel={ns}")
-
-    # -------- Build Tigramite DataFrame with explicit missing mask --------
+    # PCMCI dataframe with explicit mask
     df_mask   = ~np.isfinite(X_daily)
-    X_filled  = np.where(df_mask, 0.0, X_daily)      # value ignored where mask=True
+    X_filled  = np.where(df_mask, 0.0, X_daily)
     df_daily = pp.DataFrame(
-        X_filled, var_names=var_names, mask=df_mask,
+        X_filled,
+        var_names=var_names,
+        mask=df_mask,
         remove_missing_upto_maxlag=True
     )
 
-    # -------- Pre-screen + PCMCI --------
-    sel = _prescreen_links(X_daily, r0=r0_base, tau_max=tau_max)
+    # Prescreen & PCMCI
+    tau_max_used = 7
+    sel = _prescreen_links(X_daily, r0=r0_base, tau_max=tau_max_used)
     pc_total_est = _estimate_pc_tests(sel, max_conds_dim=max_conds_dim, max_combinations=max_combinations)
-    link_assump = _to_link_assumptions(sel, K=X_daily.shape[1], tau_min=1, tau_max=tau_max)
+    link_assump  = _to_link_assumptions(sel, K=X_daily.shape[1], tau_min=1, tau_max=tau_max_used)
 
-    print(f"[pcmci] estimated PC tests: {pc_total_est:,}")
-    pcmci = PCMCI(dataframe=df_daily, cond_ind_test=ParCorr(significance="analytic"), verbosity=0)
-
-    # Monkey-patch a progress bar over PCMCI condition iterations
-    _orig_iter = PCMCI._iter_conditions
-    pbar = None
-    try:
-        from tqdm.auto import tqdm as _tqdm
-        pbar = _tqdm(total=int(pc_total_est), desc="PCMCI", unit="test")
-        def iter_with_tqdm(self, parent, conds_dim, all_parents):
-            for cond in _orig_iter(self, parent, conds_dim, all_parents):
-                pbar.update(1)
-                yield cond
-        pcmci._iter_conditions = iter_with_tqdm.__get__(pcmci, PCMCI)
-    except Exception:
-        pass
-
+    pcmci = PCMCI(
+        dataframe=df_daily,
+        cond_ind_test=ParCorr(significance="analytic"),
+        verbosity=0,
+    )
     res = pcmci.run_pcmci(
-        tau_min=1, tau_max=tau_max,
+        tau_min=1, tau_max=tau_max_used,
         pc_alpha=pc_alpha_base,
         max_conds_dim=max_conds_dim,
         max_combinations=max_combinations,
         link_assumptions=link_assump,
     )
     qvals = pcmci.get_corrected_pvalues(res["p_matrix"], fdr_method="fdr_bh")
-    if pbar is not None:
-        pbar.close()
 
     val_matrix = res["val_matrix"]
     q_matrix   = qvals
 
-    # -------- Build two graphs (loose / strict) --------
+    # ===== Network drawing with dual alpha thresholds =====
+    import matplotlib.patheffects as pe
+    import matplotlib as mpl
+    from matplotlib import colormaps
+
+    mpl.rcParams.update({"font.size": 16, "axes.titlesize": 20})
+
+    def max_abs_autocorr(x, tau_max=5):
+        return _max_abs_autocorr(x, tau_max=tau_max)
+
+    node_ac = {name: max_abs_autocorr(X_daily[:, j], tau_max=tau_max_used)
+               for j, name in enumerate(var_names)}
+    ac_norm = Normalize(vmin=0.0, vmax=0.8)
+    ac_cmap = colormaps.get_cmap('YlOrRd')
+    node_colors = [ac_cmap(ac_norm(node_ac[n])) for n in var_names]
+
+    alpha_loose, alpha_strict = 0.05, 0.0001
     EDGE_ABS_MAX = 0.8
     rho_norm = Normalize(vmin=-EDGE_ABS_MAX, vmax=EDGE_ABS_MAX)
     rho_cmap = get_cmap('coolwarm')
 
-    # node color: auto-corr
-    node_ac  = {name: _max_abs_autocorr(X_daily[:, j], tau_max=tau_max) for j, name in enumerate(var_names)}
-    ac_norm  = Normalize(vmin=0.0, vmax=0.8)
-    ac_cmap  = get_cmap('YlOrRd')
-    node_cols = [ac_cmap(ac_norm(node_ac[n])) for n in var_names]
+    name_to_idx = {n:i for i,n in enumerate(var_names)}
 
-    # pick edges per (alpha, min_abs)
-    def _pick_edges(var_names, q, val, tau_max, alpha, min_abs):
+    def pick_display_edges(var_names, q, val, tau_max, alpha_loose, min_abs, rule='min_q'):
         edges = {}
         K = len(var_names)
         for s in range(K):
             for t in range(K):
                 if s == t: 
                     continue
-                best = None
+                cands = []
                 for lag in range(1, tau_max+1):
-                    qv = float(q[s, t, lag]); rv = float(val[s, t, lag])
-                    if not (np.isfinite(qv) and np.isfinite(rv)):
+                    qv = float(q[s, t, lag])
+                    rv = float(val[s, t, lag])
+                    if (not np.isfinite(qv)) or (not np.isfinite(rv)): 
                         continue
-                    if qv < alpha and abs(rv) >= min_abs:
-                        if best is None or qv < best[1]:
-                            best = (lag, qv, rv)
-                if best is not None:
-                    edges[(var_names[s], var_names[t])] = {
-                        'lag': int(best[0]), 'q': float(best[1]), 'weight': float(best[2])
-                    }
+                    if (qv < alpha_loose) and (abs(rv) >= min_abs):
+                        cands.append((lag, qv, rv))
+                if not cands:
+                    continue
+                if rule == 'max_abs_r':
+                    lag_sel, q_sel, r_sel = max(cands, key=lambda x: abs(x[2]))
+                else:
+                    lag_sel, q_sel, r_sel = min(cands, key=lambda x: x[1])
+                u = var_names[s]; v = var_names[t]
+                edges[(u, v)] = {'lag': int(lag_sel), 'q': float(q_sel), 'weight': float(r_sel)}
         return edges
 
-    edges_loose  = _pick_edges(var_names, q_matrix, val_matrix, tau_max, alpha_loose,  min_abs)
-    edges_strict = _pick_edges(var_names, q_matrix, val_matrix, tau_max, alpha_strict, min_abs)
+    display_edges = pick_display_edges(var_names, q_matrix, val_matrix,
+                                       tau_max=tau_max_used, alpha_loose=alpha_loose,
+                                       min_abs=0.05, rule='min_q')
 
     G_left = nx.DiGraph();  G_left.add_nodes_from(var_names)
-    for (u, v), d in edges_loose.items():   G_left.add_edge(u, v, **d)
+    for (u, v), d in display_edges.items():
+        G_left.add_edge(u, v, lag=d['lag'], weight=d['weight'])
+
     G_right = nx.DiGraph(); G_right.add_nodes_from(var_names)
-    for (u, v), d in edges_strict.items():  G_right.add_edge(u, v, **d)
+    for (u, v), d in display_edges.items():
+        s, t = name_to_idx[u], name_to_idx[v]
+        lag  = d['lag']
+        qv   = float(q_matrix[s, t, lag]); rv = float(val_matrix[s, t, lag])
+        if (np.isfinite(qv) and np.isfinite(rv)
+            and (qv < alpha_strict) and (abs(rv) >= 0.05)):
+            G_right.add_edge(u, v, lag=lag, weight=rv)
 
-    # -------- Draw two-panel figure --------
-    mpl = matplotlib
-    mpl.rcParams.update({"font.size": 14, "axes.titlesize": 18})
+    assert set(G_right.edges()).issubset(set(G_left.edges()))
 
-    pos = nx.circular_layout(G_left if len(G_right)==0 else nx.compose(G_left, G_right))
+    def soften(color_rgba, amt=0.55, alpha=0.98):
+        rgb = np.array(color_rgba[:3])
+        rgb_soft = 1.0 - amt * (1.0 - rgb)
+        return (rgb_soft[0], rgb_soft[1], rgb_soft[2], alpha)
 
-    def _edge_draw(G, ax):
-        e_cols = [_soften(rho_cmap(rho_norm(d['weight'])), amt=0.55, alpha=0.98) for *_ , d in G.edges(data=True)]
-        e_widths = [3.0 + 6.0*abs(d['weight'])/EDGE_ABS_MAX for *_ , d in G.edges(data=True)]
-        nx.draw_networkx_edges(G, pos, edge_color=e_cols, width=e_widths,
-                               arrowsize=14, connectionstyle='arc3,rad=0.12', ax=ax)
-        # edge labels = lag
+    def wrap_label(text: str, max_line_len=12):
+        words = text.split(); lines, cur = [], ""
+        for w in words:
+            if len(cur) + (1 if cur else 0) + len(w) <= max_line_len:
+                cur = f"{cur} {w}".strip()
+            else:
+                lines.append(cur); cur = w
+        if cur: lines.append(cur)
+        return "\n".join(lines)
+
+    def autosize(text: str, base=18, min_size=14):
+        L = len(text.replace("\n",""))
+        if L <= 14: return base
+        if L <= 20: return base - 1
+        if L <= 28: return base - 2
+        return max(min_size, base - 3)
+
+    def compute_node_label_positions(pos, label_pos_push=0.16, min_dist=0.060, step=0.014, max_iter=100):
+        xy = np.array(list(pos.values())); center = xy.mean(axis=0)
+        used, out = [], {}
+        for n, p in pos.items():
+            p = np.array(p); vec = p - center
+            nrm = np.linalg.norm(vec)
+            vec = np.array([1.0,0.0]) if nrm<1e-12 else vec/nrm
+            cur = p + label_pos_push * vec
+            safe, iters = False, 0
+            while not safe and iters < max_iter:
+                safe = True
+                for uxy in used:
+                    if np.linalg.norm(cur - uxy) < min_dist:
+                        cur = cur + step * vec; safe = False; break
+                iters += 1
+            out[n] = (float(cur[0]), float(cur[1])); used.append(cur)
+        return out
+
+    def compute_edge_label_positions(G, pos, label_pos=0.5, base_push=0.025, min_dist=0.055, step=0.014):
+        xy = np.array(list(pos.values())); center = xy.mean(axis=0)
+        used, out = [], {}
         for (u, v, d) in G.edges(data=True):
-            (x1, y1) = pos[u]; (x2, y2) = pos[v]
-            lx, ly = 0.5*(x1+x2), 0.5*(y1+y2)
-            txt = ax.text(lx, ly, f"{d['lag']}", fontsize=12, color='black', ha='center', va='center', zorder=5)
-            txt.set_path_effects([pe.withStroke(linewidth=1.6, foreground='white')])
+            p1 = np.array(pos[u]); p2 = np.array(pos[v])
+            m  = p1 + label_pos * (p2 - p1)
+            vec = m - center; nrm = np.linalg.norm(vec)
+            vec = vec / (nrm + 1e-12)
+            cur = m + base_push * vec
+            safe = False; iters = 0
+            while not safe and iters < 100:
+                safe = True
+                for uxy in used:
+                    if np.linalg.norm(cur - uxy) < min_dist:
+                        cur = cur + step * vec; safe = False; break
+                iters += 1
+            out[(u, v)] = (float(cur[0]), float(cur[1])); used.append(cur)
+        return out
 
-    labels_wrapped = {n: _wrap_label(n, 12) for n in var_names}
+    G_union = nx.compose(G_left, G_right)
+    if len(G_union.nodes) == 0: G_union.add_nodes_from(var_names)
+    pos = nx.circular_layout(G_union)
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 8), dpi=300)
-    for ax, G, name in zip(axes, (G_left, G_right), (f"α={alpha_loose}", f"α={alpha_strict}")):
+    labels_full_wrapped = {n: wrap_label(n, max_line_len=12) for n in var_names}
+    node_label_pos = compute_node_label_positions(pos)
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8), dpi=300, constrained_layout=False)
+    STROKE_W  = 1.2
+    FONT_EDGE = 16
+
+    for ax, G, title_alpha in zip(axes, (G_left, G_right), (alpha_loose, alpha_strict)):
         nx.draw_networkx_nodes(G, pos, node_size=[520]*len(G.nodes),
-                               node_color=[ac_cmap(ac_norm(node_ac[n])) for n in G.nodes],
-                               linewidths=1.6, edgecolors='white', ax=ax)
-        _edge_draw(G, ax)
-        nx.draw_networkx_labels(G, pos, labels=labels_wrapped, font_size=14, ax=ax)
-        ax.set_title(name); ax.axis('off')
+                               node_color=node_colors, linewidths=1.6, edgecolors='white', ax=ax)
 
-    fig.suptitle(rf"$\tau_{{\max}}={tau_max}$ days", fontsize=20, y=0.98)
+        e_cols_raw = [rho_cmap(rho_norm(d['weight'])) for *_ , d in G.edges(data=True)]
+        e_colors   = [soften(c, amt=0.55, alpha=0.98) for c in e_cols_raw]
+        e_widths   = [3.0 + 6.0*abs(d['weight'])/EDGE_ABS_MAX for *_ , d in G.edges(data=True)]
+        nx.draw_networkx_edges(G, pos, edge_color=e_colors, width=e_widths,
+                               arrowsize=14, connectionstyle='arc3,rad=0.12', ax=ax)
 
-    # colorbars
-    sm_edges = ScalarMappable(cmap=rho_cmap, norm=rho_norm); sm_edges.set_array([])
-    sm_nodes = ScalarMappable(cmap=ac_cmap,  norm=ac_norm);  sm_nodes.set_array([])
-    cax1 = fig.add_axes([0.25, 0.08, 0.5, 0.025])
-    cax2 = fig.add_axes([0.25, 0.03, 0.5, 0.025])
-    cb1 = fig.colorbar(sm_edges, cax=cax1, orientation='horizontal'); cb1.set_label("Conditional Cross-correlation")
-    cb2 = fig.colorbar(sm_nodes, cax=cax2, orientation='horizontal'); cb2.set_label("Autocorrelation")
+        for n in G.nodes:
+            x0, y0 = pos[n]; lx, ly = node_label_pos[n]
+            label  = labels_full_wrapped[n]
+            fs     = autosize(label)
+            import matplotlib.patheffects as pe
+            txt = ax.text(lx, ly, label, fontsize=fs, color='black', ha='center', va='center', zorder=6, linespacing=1.0)
+            txt.set_path_effects([pe.withStroke(linewidth=2.0, foreground='white')])
+            ax.plot([x0, lx], [y0, ly], lw=1.2, color='gray', alpha=0.5, zorder=4)
 
-    # save
-    out_png = f"{fig_prefix}_NaNmask_STRICT.png"
-    out_svg = f"{fig_prefix}_NaNmask_STRICT.svg"
-    fig.savefig(out_png, dpi=600, bbox_inches='tight')
-    fig.savefig(out_svg, format='svg', bbox_inches='tight')
+        custom_pos = compute_edge_label_positions(G, pos)
+        for (u, v, d) in G.edges(data=True):
+            lx, ly = custom_pos[(u, v)]
+            txt = ax.text(lx, ly, f"{d['lag']}", fontsize=FONT_EDGE, color='black', ha='center', va='center', zorder=5)
+            txt.set_path_effects([pe.withStroke(linewidth=STROKE_W, foreground='white')])
+
+        ax.set_title(rf"$\alpha={title_alpha}$", fontsize=20)
+        ax.axis('off')
+
+    fig.suptitle(rf"$\tau_{{\max}}={tau_max_used}$ days", fontsize=22, y=0.988)
+
+    # Save
+    import matplotlib as mpl
+    mpl.rcParams['svg.fonttype'] = 'none'
+    png_path = f"{fig_prefix}_NaNmask_STRICT_BIGFONT_refCB.png"
+    svg_path = f"{fig_prefix}_NaNmask_STRICT_BIGFONT_refCB.svg"
+    plt.savefig(png_path, dpi=600, bbox_inches='tight')
+    plt.savefig(svg_path, format='svg', bbox_inches='tight')
     plt.close(fig)
-    print(f"[pcmci] Saved -> {out_png} and {out_svg}")
+    print(f"[pcmci] Saved: {png_path} and {svg_path}")
 
 
-# ---------- CLI ----------
-def _build_parser():
-    p = argparse.ArgumentParser(description="Visualization utilities (spatial / pcmci).")
-    p.add_argument("--task", type=str, choices=["spatial", "pcmci"], required=True)
-
-    # spatial
-    p.add_argument("--array", type=str, help="2D .npy array for spatial plot")
-    p.add_argument("--title", type=str, default="Spatial Map")
-    p.add_argument("--vmin", type=float, default=-1.0)
-    p.add_argument("--vmax", type=float, default=1.0)
-    p.add_argument("--steps", type=int, default=21)
-    p.add_argument("--out", type=str, default="spatial.png")
-    p.add_argument("--lat0", type=int, default=45)
-    p.add_argument("--lat1", type=int, default=85)
-    p.add_argument("--lon0", type=int, default=80)
-    p.add_argument("--lon1", type=int, default=180)
-    p.add_argument("--downsample", type=int, default=2)
-
-    # pcmci
-    p.add_argument("--env", type=str, default="region_env.npy")
-    p.add_argument("--hurr", type=str, default="region_hurr.npy")
-    p.add_argument("--saliency_dir", type=str, default="runs_FULL_9/run_01/maps_9Channels_3")
-    p.add_argument("--sp_h", type=int, default=2)
-    p.add_argument("--sp_w", type=int, default=2)
-    p.add_argument("--th_sal", type=float, default=0.75)
-    p.add_argument("--fallback_topq", type=float, default=0.80)
-    p.add_argument("--min_exp", type=float, default=0.05)
-    p.add_argument("--pre_days", type=int, default=7)
-    p.add_argument("--tau_max", type=int, default=7)
-    p.add_argument("--r0_base", type=float, default=0.05)
-    p.add_argument("--pc_alpha_base", type=float, default=0.1)
-    p.add_argument("--alpha_loose", type=float, default=0.05)
-    p.add_argument("--alpha_strict", type=float, default=0.0001)
-    p.add_argument("--min_abs", type=float, default=0.05)
-    p.add_argument("--max_conds_dim", type=int, default=2)
-    p.add_argument("--max_combinations", type=int, default=100000)
-    p.add_argument("--fig_prefix", type=str, default="PCMCI_PRE7MASK")
-    return p
+# ============================================================
+# ============== Integrated Gradients Saliency ===============
+# ============================================================
+def _make_geo_grid_from_hw(Hs: int, Ws: int, ds_factor: int = DOWNSAMPLE_FACTOR):
+    """Infer NA region bounds from size and create grid."""
+    # This assumes region is (40,100) from (lat0,lon0) = (45,80)
+    lat0, lon0 = 45, 80
+    bounds, grids = utils.geo_bounds_and_grid(Hs, Ws, region_lat0=lat0, region_lon0=lon0, ds_factor=ds_factor)
+    return bounds, grids
 
 
-def main():
-    parser = _build_parser()
-    args = parser.parse_args()
+def compute_and_save_saliency(run_dir: Path,
+                              best_weight_path: Path,
+                              val_loader: DataLoader,
+                              device: torch.device,
+                              in_ch: int,
+                              channel_names=None):
+    """
+    Compute Integrated Gradients saliency maps (global + per-patch) for each channel.
+    Saves both .png and .npy for:
+      - global_saliency
+      - patch_{i}_{j}
+    Output root: run_dir / maps_<X>Channels_3/<ChannelNameSanitized>/
+    """
+    from model import RevisedHierarchicalPatchTimesformer
 
-    if args.task == "spatial":
-        if not args.array:
-            raise SystemExit("--array is required for task=spatial")
-        spatial_main(
-            array_path=args.array, title=args.title, vmin=args.vmin, vmax=args.vmax,
-            steps=args.steps, out_path=args.out, lat0=args.lat0, lat1=args.lat1,
-            lon0=args.lon0, lon1=args.lon1, downsample=args.downsample
-        )
-    else:
-        pcmci_main(
-            env_path=args.env, hurr_path=args.hurr, saliency_dir=args.saliency_dir,
-            sp_h=args.sp_h, sp_w=args.sp_w, th_sal=args.th_sal, fallback_topq=args.fallback_topq,
-            min_exp=args.min_exp, pre_days=args.pre_days, tau_max=args.tau_max,
-            r0_base=args.r0_base, pc_alpha_base=args.pc_alpha_base,
-            alpha_loose=args.alpha_loose, alpha_strict=args.alpha_strict,
-            min_abs=args.min_abs, max_conds_dim=args.max_conds_dim,
-            max_combinations=args.max_combinations, fig_prefix=args.fig_prefix
-        )
+    # Rebuild model and load weights
+    model = RevisedHierarchicalPatchTimesformer(in_ch=in_ch).to(device)
+    model.load_state_dict(torch.load(best_weight_path, map_location=device))
+    model.eval()
+
+    # Probe H,W and n_lat,n_lon
+    sample_x, y = next(iter(val_loader))
+    Hs, Ws = sample_x.shape[-2:]
+    with torch.no_grad():
+        _, _, n_lat, n_lon = model(sample_x[:1].to(device)).shape
+
+    geo_bounds, grids = _make_geo_grid_from_hw(Hs, Ws, ds_factor=DOWNSAMPLE_FACTOR)
+    levels = np.linspace(-1, 1, 21)
+
+    tag_ch = f"{in_ch}Channels_3"
+    base_dir = run_dir / f"maps_{tag_ch}"
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    # IG setup
+    alphas = torch.linspace(0.0, 1.0, IG_STEPS, device=device)
+
+    # channel names
+    if channel_names is None:
+        channel_names = CHANNEL_NAMES_9 if in_ch == 9 else (CHANNEL_NAMES_28 if in_ch == 28 else [f"Ch{c}" for c in range(in_ch)])
+
+    for c, name in enumerate(channel_names):
+        safe_name = re.sub(r'[^\w_]', '_', name)
+        print(f"[{run_dir.name}] Saliency - Channel {c}: {name}")
+
+        patch_sum = {(i,j): np.zeros((Hs, Ws), dtype=np.float32) for i in range(n_lat) for j in range(n_lon)}
+        patch_count = {(i,j): 0 for i in range(n_lat) for j in range(n_lon)}
+        global_sum = np.zeros((Hs, Ws), dtype=np.float32)
+        global_count = 0
+
+        for x_batch, y_batch in val_loader:
+            B = x_batch.shape[0]
+            x_batch = x_batch.to(device)                      # (B,T,C,H,W)
+            baseline = torch.zeros_like(x_batch)
+            diff = x_batch - baseline
+
+            # ----- global IG -----
+            total_grad = torch.zeros_like(x_batch)
+            for alpha in alphas:
+                inp = baseline + alpha * diff
+                inp.requires_grad_(True)
+                logits = model(inp)                           # (B, T, n_lat, n_lon)
+                score = logits.sum(dim=(1,2,3))               # (B,)
+                model.zero_grad()
+                score.sum().backward()
+                total_grad += inp.grad
+            ig_global = diff * total_grad / IG_STEPS
+            sal_global = ig_global[:,:,c,:,:].abs().mean(dim=1).detach().cpu().numpy()  # (B,H,W)
+            global_sum += sal_global.sum(axis=0)
+            global_count += B
+
+            # ----- patch-specific IG -----
+            for i in range(n_lat):
+                for j in range(n_lon):
+                    total_grad_p = torch.zeros_like(x_batch)
+                    for alpha in alphas:
+                        inp = baseline + alpha * diff
+                        inp.requires_grad_(True)
+                        out = model(inp)[:,:,i,j].sum(dim=(1,))
+                        model.zero_grad()
+                        out.sum().backward()
+                        total_grad_p += inp.grad
+                    ig_patch = diff * total_grad_p / IG_STEPS
+                    sal_patch = ig_patch[:,:,c,:,:].abs().mean(dim=1).detach().cpu().numpy()  # (B,H,W)
+                    patch_sum[(i,j)] += sal_patch.sum(axis=0)
+                    patch_count[(i,j)] += B
+
+        # save patch-specific maps (image + npy)
+        chan_dir = base_dir / safe_name
+        chan_dir.mkdir(parents=True, exist_ok=True)
+
+        for (i,j), sum_map in patch_sum.items():
+            if patch_count[(i,j)] == 0:
+                continue
+            mean_patch = sum_map / patch_count[(i,j)]
+            sm = gaussian_filter(mean_patch, sigma=1.0)
+            ds = sm[::DOWNSAMPLE_FACTOR, ::DOWNSAMPLE_FACTOR]
+            ma = float(np.max(np.abs(ds))) if np.any(np.isfinite(ds)) else 1.0
+            if ma == 0: ma = 1.0
+            norm_patch = ds / ma
+
+            np.save(chan_dir / f'patch_{i}_{j}.npy', norm_patch)
+            _save_contour(
+                fig_path=str(chan_dir / f'patch_{i}_{j}.png'),
+                data_ds=norm_patch,
+                title=f'{name} – Patch ({i},{j})',
+                geo_bounds=geo_bounds,
+                grids=grids,
+                levels=levels
+            )
+
+        # save global map (image + npy)
+        if global_count > 0:
+            mean_global = global_sum / global_count
+            smg = gaussian_filter(mean_global, sigma=1.0)
+            dsg = smg[::DOWNSAMPLE_FACTOR, ::DOWNSAMPLE_FACTOR]
+            mg = float(np.max(np.abs(dsg))) if np.any(np.isfinite(dsg)) else 1.0
+            if mg == 0: mg = 1.0
+            norm_global = dsg / mg
+
+            np.save(chan_dir / 'global_saliency.npy', norm_global)
+            _save_contour(
+                fig_path=str(chan_dir / 'global_saliency.png'),
+                data_ds=norm_global,
+                title=name,
+                geo_bounds=geo_bounds,
+                grids=grids,
+                levels=levels
+            )
+
+        print(f"[{run_dir.name}] Saliency done for channel: {name}\n")
 
 
-if __name__ == "__main__":
-    main()
+# ============================================================
+# ============= Entry to run saliency from run.py ============
+# ============================================================
+def saliency_entrypoint(ckpt_path: str,
+                        run_dir: str,
+                        env_path: str,
+                        hurr_path: str,
+                        seq_len: int = 14,
+                        stride: int = 3,
+                        batch_size: int = 4,
+                        in_ch: int = None):
+    """
+    Build a light validation loader from env/hurr, then run IG saliency for all channels.
+    This is designed to be triggered from `run.py spatial` when --saliency_ckpt is provided.
+    """
+    from train import HurricanePatchDataset  # reuse dataset logic
+
+    env = np.load(env_path)
+    T, H, W, C = env.shape
+    if in_ch is None:
+        in_ch = C
+
+    # Build dataset and a small validation loader (10% split)
+    full_ds = HurricanePatchDataset(
+        env_path=env_path, hurr_path=hurr_path,
+        seq_len=seq_len, stride=stride,
+        in_ch=in_ch, H=H, W=W, patch_h=20, patch_w=20
+    )
+
+    n_total = len(full_ds)
+    n_train = max(1, int(n_total*0.9))
+    n_val   = max(1, n_total - n_train)
+    _, val_ds = random_split(full_ds, [n_train, n_val], generator=torch.Generator().manual_seed(2024))
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    compute_and_save_saliency(
+        run_dir=Path(run_dir),
+        best_weight_path=Path(ckpt_path),
+        val_loader=val_loader,
+        device=device,
+        in_ch=in_ch,
+        channel_names=(CHANNEL_NAMES_9 if in_ch == 9 else (CHANNEL_NAMES_28 if in_ch == 28 else None))
+    )

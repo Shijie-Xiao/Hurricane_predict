@@ -21,6 +21,61 @@ from pathlib import Path
 import utils
 import visualize
 import train as trainer  # train.py
+import heatmap
+
+def cmd_patches(args):
+    """Generate 20x20 patches from region files."""
+    heatmap.make_patches_20x20(
+        region_env_path=args.env,
+        region_hurr_path=args.hurr,
+        out_env_patches=args.out_env_patches,
+        out_hurr_patches=args.out_hurr_patches,
+        patch_h=args.patch_h,
+        patch_w=args.patch_w,
+    )
+
+def cmd_heatmap_train(args):
+    """Train frame-level UNet heatmap model on patches."""
+    heatmap.train_heatmap(
+        env_patches_path=args.env_patches,
+        hurr_patches_path=args.hurr_patches,
+        sigma=args.sigma,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        lr=args.lr,
+        val_split=args.val_split,
+        out_ckpt=args.out_ckpt,
+        seed=args.seed,
+    )
+
+def cmd_heatmap_eval(args):
+    """
+    Evaluate Timesformer + UNet heatmap.
+    Requires a validation loader produced by your existing train_9.py / train.py.
+    For simplicity here we import its dataset maker if available; otherwise, please pass a saved val loader.
+    """
+    try:
+        from train_9 import build_loaders as build_timesformer_loaders
+    except Exception:
+        from train import build_loaders as build_timesformer_loaders
+
+    loaders = build_timesformer_loaders(
+        env_path=args.env, hurr_path=args.hurr,
+        seq_len=args.seq_len, stride=args.stride,
+        batch_size=args.batch_size, in_ch=args.in_ch,
+        seed=args.seed
+    )
+    _, val_loader = loaders
+    heatmap.eval_heatmap_frames(
+        best_patch_timesformer_ckpt=args.patch_ckpt,
+        best_unet_heatmap_ckpt=args.unet_ckpt,
+        val_loader_timesformer=val_loader,
+        seq_len=args.seq_len,
+        region_lat0=args.lat0, region_lon0=args.lon0,
+        n_lat_full=args.n_lat_full, n_lon_full=args.n_lon_full,
+        out_dir=args.out_dir,
+        sample_frames=args.sample_frames,
+    )
 
 
 def cmd_prepare(args):
@@ -109,17 +164,43 @@ def cmd_pcmci(args):
 
 
 def cmd_spatial(args):
-    """Quick spatial plot for a .npy array (2D)."""
-    visualize.spatial_main(
-        array_path=args.array,
-        title=args.title,
-        vmin=args.vmin,
-        vmax=args.vmax,
-        steps=args.steps,
-        out_path=args.out or "spatial.png",
-        lat0=args.lat0, lat1=args.lat1, lon0=args.lon0, lon1=args.lon1,
-        downsample=args.downsample
-    )
+    """
+    Quick spatial plot for a .npy array (2D).
+
+    Additionally, if --saliency_ckpt is provided, this will also compute and save
+    Integrated Gradients saliency maps for ALL channels, using the given checkpoint
+    and env/hurr files, saving under <run_dir>/maps_<in_ch>Channels_3/<ChannelName>/...
+    """
+    # 1) Basic quick plot (if --array is given)
+    if args.array:
+        visualize.spatial_main(
+            array_path=args.array,
+            title=args.title,
+            vmin=args.vmin,
+            vmax=args.vmax,
+            steps=args.steps,
+            out_path=args.out or "spatial.png",
+            lat0=args.lat0, lat1=args.lat1, lon0=args.lon0, lon1=args.lon1,
+            downsample=args.downsample
+        )
+
+    # 2) Optional: run IG saliency batch if checkpoint is provided
+    if args.saliency_ckpt:
+        if not args.env or not args.hurr:
+            raise ValueError("When using --saliency_ckpt, please also provide --env and --hurr.")
+        run_dir = args.run_dir or "runs_FULL_auto/run_01"
+        print(f"[spatial] Running IG saliency from ckpt={args.saliency_ckpt} into {run_dir}")
+        visualize.saliency_entrypoint(
+            ckpt_path=args.saliency_ckpt,
+            run_dir=run_dir,
+            env_path=args.env,
+            hurr_path=args.hurr,
+            seq_len=args.seq_len,
+            stride=args.stride,
+            batch_size=args.batch_size,
+            in_ch=args.in_ch
+        )
+
 
 
 def cmd_placeholder(_):
@@ -186,8 +267,8 @@ def build_parser():
     sp.set_defaults(func=cmd_pcmci)
 
     # spatial
-    sp = sub.add_parser("spatial", help="Quick spatial contour plot for a 2D array (.npy).")
-    sp.add_argument("--array", type=str, required=True)
+    sp = sub.add_parser("spatial", help="Quick spatial plot for a 2D array (.npy); optionally compute IG saliency for all channels.")
+    sp.add_argument("--array", type=str, default=None, help="Path to a 2D .npy array to plot (optional).")
     sp.add_argument("--title", type=str, default="Spatial Map")
     sp.add_argument("--vmin", type=float, default=-1.0)
     sp.add_argument("--vmax", type=float, default=1.0)
@@ -198,7 +279,67 @@ def build_parser():
     sp.add_argument("--lon0", type=int, default=80)
     sp.add_argument("--lon1", type=int, default=180)
     sp.add_argument("--downsample", type=int, default=2)
+
+    # ↓↓↓ New options to trigger IG saliency batch generation ↓↓↓
+    sp.add_argument("--saliency_ckpt", type=str, default=None,
+                    help="Path to a trained checkpoint (.pt). If set, compute IG saliency for all channels.")
+    sp.add_argument("--run_dir", type=str, default=None,
+                    help="Where to save saliency outputs (default: runs_FULL_auto/run_01).")
+    sp.add_argument("--env", type=str, default=None,
+                    help="Env array (T,40,100,C) used to build validation loader for saliency.")
+    sp.add_argument("--hurr", type=str, default=None,
+                    help="Hurr mask (T,40,100) used to build validation loader for saliency.")
+    sp.add_argument("--in_ch", type=int, default=None,
+                    help="If None, inferred from env last dim.")
+    sp.add_argument("--seq_len", type=int, default=14)
+    sp.add_argument("--stride",  type=int, default=3)
+    sp.add_argument("--batch_size", type=int, default=4)
+
     sp.set_defaults(func=cmd_spatial)
+
+    # patches
+    sp = sub.add_parser("patches", help="Generate 20x20 ENV/HURR patch arrays from region files.")
+    sp.add_argument("--env", type=str, default="region_env.npy")
+    sp.add_argument("--hurr", type=str, default="region_hurr.npy")
+    sp.add_argument("--out_env_patches", type=str, default="ENV_PATCHES_20x20.npy")
+    sp.add_argument("--out_hurr_patches", type=str, default="HURR_PATCHES_20x20.npy")
+    sp.add_argument("--patch_h", type=int, default=20)
+    sp.add_argument("--patch_w", type=int, default=20)
+    sp.set_defaults(func=cmd_patches)
+
+    # heatmap_train
+    sp = sub.add_parser("heatmap_train", help="Train frame-level U-Net heatmap on 20x20 patches.")
+    sp.add_argument("--env_patches", type=str, default="ENV_PATCHES_20x20.npy")
+    sp.add_argument("--hurr_patches", type=str, default="HURR_PATCHES_20x20.npy")
+    sp.add_argument("--sigma", type=float, default=1.5)
+    sp.add_argument("--batch_size", type=int, default=32)
+    sp.add_argument("--epochs", type=int, default=100)
+    sp.add_argument("--lr", type=float, default=1e-4)
+    sp.add_argument("--val_split", type=float, default=0.1)
+    sp.add_argument("--out_ckpt", type=str, default="best_unet_heatmap.pt")
+    sp.add_argument("--seed", type=int, default=1337)
+    sp.set_defaults(func=cmd_heatmap_train)
+
+    # heatmap_eval
+    sp = sub.add_parser("heatmap_eval", help="Evaluate Timesformer+UNet and export frame maps with radius rings.")
+    sp.add_argument("--patch_ckpt", type=str, default="best_patch_timesformer_by_f1.pt")
+    sp.add_argument("--unet_ckpt", type=str, default="best_unet_heatmap.pt")
+    sp.add_argument("--env", type=str, default="region_env.npy")
+    sp.add_argument("--hurr", type=str, default="region_hurr.npy")
+    sp.add_argument("--in_ch", type=int, default=None, help="Infer from env if None.")
+    sp.add_argument("--seq_len", type=int, default=7)
+    sp.add_argument("--stride", type=int, default=3)
+    sp.add_argument("--batch_size", type=int, default=8)
+    sp.add_argument("--seed", type=int, default=1337)
+    sp.add_argument("--lat0", type=int, default=45)
+    sp.add_argument("--lon0", type=int, default=80)
+    sp.add_argument("--n_lat_full", type=int, default=90)
+    sp.add_argument("--n_lon_full", type=int, default=180)
+    sp.add_argument("--out_dir", type=str, default="frame_maps_with_global_radii")
+    sp.add_argument("--sample_frames", type=int, default=10)
+    sp.set_defaults(func=cmd_heatmap_eval)
+
+
 
     # placeholders
     sub.add_parser("shap", help="Placeholder").set_defaults(func=cmd_placeholder)
