@@ -224,7 +224,15 @@ Options:
     ```python
     import utils
     result = utils.prepare_data("HURR_LOC_DAILY.npy", "X_28.npy", out_dir=".")
+    
     ```
+- **heatmap.py** – Frame‑level heatmaps on 20×20 patches (U‑Net).
+  - `make_patches_20x20(...)` – export patch arrays from region files.
+  - `HurricaneFrameHeatmapDataset` – per‑patch dataset with Gaussian‑smoothed target.
+  - `UNetFrameLevel_20x20` – U‑Net with MLP bottleneck for 20×20 inputs.
+  - `train_heatmap(...)` – training loop with `BCEWithLogitsLoss` and plateau scheduler.
+  - `eval_heatmap_frames(...)` – combine Timesformer patch predictions + U‑Net peaks, output multi‑radius maps.
+
 
 - **`requirements.txt`**  
   - Pip package dependencies (numpy, torch, matplotlib, tigramite, basemap, etc.).  
