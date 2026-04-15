@@ -18,25 +18,11 @@ requirements.txt  Pip-only dependency list
 
 ## Environment setup
 
-### Option A: NERSC Perlmutter (recommended)
-
-```bash
-ml conda && conda activate fast_ml
-pip install basemap tigramite scikit-learn   # one-time install
-```
-
-### Option B: New conda environment from scratch
-
 ```bash
 conda env create -f environment.yml
 conda activate hurricane
 ```
 
-### Option C: Existing Python + pip
-
-```bash
-pip install -r requirements.txt
-```
 
 ## Reproduce results
 
