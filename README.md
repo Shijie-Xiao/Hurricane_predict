@@ -1,7 +1,10 @@
 # Hurricane Genesis
 
 End-to-end tropical cyclone genesis (TCG) prediction, saliency analysis, and
-causal inference.  All parameters live in `config.yaml` — zero hard-coding.
+causal inference.  
+
+Code for Paper：Physics-Based Machine Learning for Tropical Cyclone3
+Genesis Comprehension in the North Atlantic Basin4
 
 ## Files
 
