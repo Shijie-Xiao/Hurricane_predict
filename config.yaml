@@ -53,7 +53,7 @@ train:
   val_split: 0.1
   runs: 3
   seed: 1337
-  pos_weight: null                    # set to e.g. 10.0 for class imbalance
+  pos_weight: 10.0                    # set to e.g. 10.0 for class imbalance
   out_dir: checkpoints
 
 viz:
