@@ -1,0 +1,21 @@
+name: hurricane
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch=2.6.0
+  - pytorch-cuda=12.4
+  - numpy
+  - scipy
+  - matplotlib
+  - pyyaml
+  - tqdm
+  - networkx
+  - scikit-learn
+  - pip
+  - pip:
+    - basemap>=2.0
+    - tigramite>=5.2

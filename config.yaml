@@ -1,0 +1,74 @@
+# Hurricane Genesis – unified configuration
+# All paths, hyperparameters, and visualization settings in one place.
+
+data:
+  hurr_path: /global/cfs/cdirs/m5011/ArenRuss/ERA5_TRAINING_DATA/HURR_LOC_DAILY_GLOBAL.npy
+  env_path:  /global/cfs/cdirs/m5011/ArenRuss/ERA5_TRAINING_DATA/NORMtraining_data_9VAR_1980-2023.npy
+  env_transpose: [1, 2, 3, 0]        # (C,T,H,W) -> (T,H,W,C)
+  region:
+    lat: [45, 85]                     # row slice -> 40 rows
+    lon: [80, 180]                    # col slice -> 100 cols
+  cache_dir: ./cache
+  channel_names:
+    - Potential Intensity
+    - Specific Humidity (850mb)
+    - Vertical Shear
+    - Relative Vorticity (500mb)
+    - Relative Vorticity (850mb)
+    - Saturation Deficit (500mb)
+    - Surface Radiation
+    - Cloud Cover (500mb)
+    - Ocean Heat Content
+
+model:
+  type: patch                         # "patch" | "hierarchical"
+  seq_len: 14
+  in_ch: 9
+  grid: [40, 100]                     # H, W after crop
+  patch: [20, 20]                     # patch_h, patch_w
+  num_heads: 8
+  # --- PatchTimesformer params ---
+  embed_dim: 128
+  depth: 4
+  # --- HierarchicalTimesformer params ---
+  small_patch: [2, 2]
+  embed_small: 64
+  depth_small: 2
+  embed_large: 128
+  depth_large: 4
+
+unet:
+  sigma: 1.5
+  epochs: 100
+  lr: 1.0e-4
+  batch_size: 32
+  out_ckpt: checkpoints/best_unet.pt
+
+train:
+  epochs: 100
+  batch_size: 8
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  stride: 3
+  val_split: 0.1
+  runs: 3
+  seed: 1337
+  pos_weight: null                    # set to e.g. 10.0 for class imbalance
+  out_dir: checkpoints
+
+viz:
+  saliency:
+    ig_steps: 20
+    downsample: 2
+    out_dir: saliency_maps
+  pcmci:
+    pre_days: 7
+    tau_max: 7
+    r0_base: 0.05
+    pc_alpha: 0.1
+    alpha_loose: 0.05
+    alpha_strict: 1.0e-4
+    min_abs: 0.05
+    max_conds_dim: 2
+    max_combinations: 100000
+    fig_prefix: PCMCI
