@@ -67,10 +67,13 @@ def saliency(cfg, ckpt_path=None):
     out_root.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cfg["model"]["type"] = "hierarchical"
     model = build_model(cfg).to(device)
 
     if ckpt_path is None:
-        ckpt_path = str(Path(cfg["train"]["out_dir"]) / "run_01" / "best.pt")
+        ckpt_path = str(
+            Path(cfg["train"]["out_dir"]) / "hierarchical" / "run_01" / "best.pt"
+        )
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     model.eval()
     print(f"[saliency] Loaded checkpoint: {ckpt_path}")

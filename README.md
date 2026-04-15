@@ -1,7 +1,7 @@
 # Hurricane Genesis
 
 End-to-end tropical cyclone genesis (TCG) prediction, saliency analysis, and
-causal inference. All parameters in a single `config.yaml` -- zero hard-coding.
+causal inference.  All parameters live in `config.yaml` — zero hard-coding.
 
 ## Files
 
@@ -9,9 +9,9 @@ causal inference. All parameters in a single `config.yaml` -- zero hard-coding.
 config.yaml       Configuration (paths / model / training / viz)
 models.py         PatchTimesformer · HierTimesformer · UNet
 dataset.py        Data prep + Dataset / DataLoader
-train.py          Training loops (classification & UNet)
+train.py          Training loops (classification & UNet) + evaluation
 viz.py            Integrated Gradients saliency · PCMCI causal graphs
-run.py            CLI entry point
+run.py            CLI entry point (two automated pipelines + individual steps)
 environment.yml   Conda environment spec
 requirements.txt  Pip-only dependency list
 ```
@@ -24,66 +24,43 @@ conda activate hurricane
 ```
 
 
-## Reproduce results
+## Prediction
 
 ```bash
-# 1. Prepare data -- crop ERA5 to North Atlantic, cache to ./cache/
-python run.py prepare
-
-# 2. Train PatchTimesformer classifier (default, best prediction accuracy)
-python run.py train
-
-# 3. Train HierTimesformer (finer saliency maps, better for visualization)
-python run.py train --override model.type=hierarchical
-
-# 4. Train UNet heatmap model (pixel-level localization within a patch)
-python run.py train --unet
-
-# 5. Compute Integrated Gradients saliency maps
-python run.py saliency
-
-# 6. Run PCMCI causal analysis
-python run.py pcmci
+python run.py predict
 ```
 
-## Config overrides
+1. **prepare** — crop ERA5 data → `./cache/`
+2. **train PatchTimesformer** — best classification accuracy
+3. **train UNet** — sub-patch pixel-level localization
+4. **eval** — classification metrics (F1, precision, recall) + UNet
+   localization distance: haversine distance from UNet heatmap peak to
+   actual genesis centroid (km)
 
-Override any `config.yaml` value from the command line:
+## Visualization
 
 ```bash
-python run.py train --override model.type=hierarchical train.epochs=50 train.runs=1
+python run.py visualize
 ```
 
-## Config sections
+1. **prepare** — crop ERA5 data → `./cache/`
+2. **train HierTimesformer** — finer spatial gradients for saliency
+3. **saliency** — Integrated Gradients maps (per-channel + per-patch)
+4. **PCMCI** — causal inference graph between environmental variables
 
-| Section | Controls |
-|---------|----------|
-| `data`  | Raw file paths, transpose, region crop, channel names |
-| `model` | Architecture (`patch` / `hierarchical`), dims, depth |
-| `unet`  | UNet heatmap hyperparameters |
-| `train` | Epochs, batch size, LR, multi-run |
-| `viz`   | IG steps, PCMCI thresholds |
+**Estimated runtime** (default config: 150 epochs × 3 runs, ig_steps=20).
+The model is small and saliency is bottlenecked by sequential Python loops,
+so GPU acceleration is modest (~2×) compared to large-model workloads.
 
-## Model architectures
+| Step | CPU | Single A100 GPU |
+|------|-----|----------------|
+| train HierTimesformer | ~12 h | ~5 h |
+| saliency (9ch × 20 IG steps × val set) | ~8 h | ~5 h |
+| PCMCI (pure numpy, no GPU) | ~30 min | ~30 min |
+| **Total** | **~20 h** | **~10 h** |
 
-**PatchTimesformer** (`model.type: patch`) -- single-stage factorized
-space-time attention on 20x20 patches (10 patches). Best prediction accuracy.
+To shorten for a quick test:
 
-**HierTimesformer** (`model.type: hierarchical`) -- two-stage: 2x2 fine
-patches (1000 tokens) pooled to 20x20 (10 tokens) with skip connections.
-Better for saliency visualization and causal analysis.
-
-**UNet** -- pixel-level heatmap within a predicted 20x20 patch for precise
-genesis location.
-
-## Data
-
-ERA5 reanalysis arrays (NERSC CFS):
-
-| File | Shape |
-|------|-------|
-| `HURR_LOC_DAILY_GLOBAL.npy` | `(T, 180, 360)` |
-| `NORMtraining_data_9VAR_1980-2023.npy` | `(9, T, 181, 360)` |
-
-The `prepare` step transposes, aligns, and crops to a North Atlantic region
-of shape `(T, 40, 100, 9)`.
+```bash
+python run.py visualize --override train.epochs=10 train.runs=1 viz.saliency.ig_steps=5
+```

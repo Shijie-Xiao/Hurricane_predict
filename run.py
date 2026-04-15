@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Hurricane Genesis CLI.
+Hurricane Genesis CLI – two automated pipelines.
 
-    python run.py prepare                 # crop raw data -> cache/
-    python run.py train                   # train Timesformer
-    python run.py train --unet            # train UNet heatmap
-    python run.py saliency                # Integrated Gradients maps
-    python run.py pcmci                   # PCMCI causal graph
+    python run.py predict     # prepare → train Patch → train UNet → eval
+    python run.py visualize   # prepare → train Hier → saliency → PCMCI
+
+Individual steps are also available:
+
+    python run.py prepare / train / eval / saliency / pcmci
 """
 
 import argparse
+import copy
 import yaml
 
 import dataset
@@ -40,6 +42,65 @@ def load_cfg(path, overrides=None):
     return cfg
 
 
+# ── automated pipelines ──────────────────────────────────────────────
+
+def cmd_predict(args):
+    """Pipeline A: prepare → train PatchTimesformer → train UNet → eval."""
+    cfg = load_cfg(args.config, args.override)
+    cfg["model"]["type"] = "patch"
+
+    print("=" * 60)
+    print("[pipeline] PREDICT: prepare → train(patch) → train(unet) → eval")
+    print("=" * 60)
+
+    print("\n>>> Step 1/4: prepare data")
+    dataset.prepare_data(cfg)
+
+    print("\n>>> Step 2/4: train PatchTimesformer")
+    results = train.train_cls(cfg)
+    best_ckpt = max(results, key=lambda r: r[1])[0]
+
+    print("\n>>> Step 3/4: train UNet (sub-patch localization)")
+    train.train_unet(cfg)
+
+    print("\n>>> Step 4/4: evaluate (classification + geographic distance)")
+    train.eval_cls(cfg, ckpt_path=best_ckpt)
+
+    print("\n" + "=" * 60)
+    print("[pipeline] PREDICT complete.")
+    print("=" * 60)
+
+
+def cmd_visualize(args):
+    """Pipeline B: prepare → train HierTimesformer → saliency → PCMCI."""
+    cfg = load_cfg(args.config, args.override)
+
+    print("=" * 60)
+    print("[pipeline] VISUALIZE: prepare → train(hier) → saliency → PCMCI")
+    print("=" * 60)
+
+    print("\n>>> Step 1/4: prepare data")
+    dataset.prepare_data(cfg)
+
+    print("\n>>> Step 2/4: train HierTimesformer")
+    cfg_hier = copy.deepcopy(cfg)
+    cfg_hier["model"]["type"] = "hierarchical"
+    results = train.train_cls(cfg_hier)
+    best_ckpt = max(results, key=lambda r: r[1])[0]
+
+    print("\n>>> Step 3/4: Integrated Gradients saliency")
+    viz.saliency(cfg_hier, ckpt_path=best_ckpt)
+
+    print("\n>>> Step 4/4: PCMCI causal analysis")
+    viz.pcmci(cfg_hier)
+
+    print("\n" + "=" * 60)
+    print("[pipeline] VISUALIZE complete.")
+    print("=" * 60)
+
+
+# ── individual step commands ─────────────────────────────────────────
+
 def cmd_prepare(args):
     cfg = load_cfg(args.config, args.override)
     dataset.prepare_data(cfg)
@@ -53,6 +114,11 @@ def cmd_train(args):
         train.train_cls(cfg)
 
 
+def cmd_eval(args):
+    cfg = load_cfg(args.config, args.override)
+    train.eval_cls(cfg, ckpt_path=args.ckpt)
+
+
 def cmd_saliency(args):
     cfg = load_cfg(args.config, args.override)
     viz.saliency(cfg, ckpt_path=args.ckpt)
@@ -63,6 +129,8 @@ def cmd_pcmci(args):
     viz.pcmci(cfg, saliency_dir=args.saliency_dir)
 
 
+# ── CLI ──────────────────────────────────────────────────────────────
+
 def _add_common(sp):
     sp.add_argument("--config", default="config.yaml")
     sp.add_argument("--override", nargs="*", default=[], metavar="KEY=VAL",
@@ -70,17 +138,32 @@ def _add_common(sp):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Hurricane Genesis CLI")
+    p = argparse.ArgumentParser(
+        description="Hurricane Genesis – prediction & visualization pipelines",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    _add_common(sub.add_parser(
+        "predict",
+        help="Full pipeline: prepare → train Patch + UNet → eval"))
+    _add_common(sub.add_parser(
+        "visualize",
+        help="Full pipeline: prepare → train Hier → saliency → PCMCI"))
 
     _add_common(sub.add_parser("prepare", help="Crop raw data and cache"))
 
-    sp = sub.add_parser("train", help="Train model")
-    sp.add_argument("--unet", action="store_true", help="Train UNet instead of Timesformer")
+    sp = sub.add_parser("train", help="Train a single model")
+    sp.add_argument("--unet", action="store_true")
+    _add_common(sp)
+
+    sp = sub.add_parser("eval", help="Evaluate checkpoint")
+    sp.add_argument("--ckpt", default=None)
     _add_common(sp)
 
     sp = sub.add_parser("saliency", help="Compute IG saliency maps")
-    sp.add_argument("--ckpt", default=None, help="Checkpoint path (default: auto)")
+    sp.add_argument("--ckpt", default=None)
     _add_common(sp)
 
     sp = sub.add_parser("pcmci", help="Run PCMCI causal analysis")
@@ -88,8 +171,12 @@ def main():
     _add_common(sp)
 
     args = p.parse_args()
-    {"prepare": cmd_prepare, "train": cmd_train,
-     "saliency": cmd_saliency, "pcmci": cmd_pcmci}[args.cmd](args)
+    dispatch = {
+        "predict": cmd_predict, "visualize": cmd_visualize,
+        "prepare": cmd_prepare, "train": cmd_train, "eval": cmd_eval,
+        "saliency": cmd_saliency, "pcmci": cmd_pcmci,
+    }
+    dispatch[args.cmd](args)
 
 
 if __name__ == "__main__":

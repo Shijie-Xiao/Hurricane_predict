@@ -1,6 +1,7 @@
 """Training loops for classification (Timesformer) and heatmap (UNet) models."""
 
 from pathlib import Path
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -8,7 +9,8 @@ import torch.optim as optim
 from tqdm.auto import tqdm
 
 from models import build_model, UNet
-from dataset import build_loaders
+from dataset import build_loaders, PatchDataset
+from torch.utils.data import DataLoader, random_split
 
 
 def _metrics(y_true, y_pred):
@@ -32,7 +34,7 @@ def _run_one(run_dir, model, device, train_loader, val_loader, cfg):
         crit = nn.BCEWithLogitsLoss()
     opt = optim.AdamW(model.parameters(), lr=tc["lr"], weight_decay=tc["weight_decay"])
 
-    best_f1, best_path = 0.0, run_dir / "best.pt"
+    best_f1, best_path = -1.0, run_dir / "best.pt"
     for ep in range(1, tc["epochs"] + 1):
         model.train()
         loss_sum, yt, yp = 0.0, [], []
@@ -77,7 +79,8 @@ def train_cls(cfg):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_loader, val_loader = build_loaders(cfg, for_unet=False)
 
-    out = Path(tc["out_dir"]); out.mkdir(parents=True, exist_ok=True)
+    mtype = cfg["model"]["type"]
+    out = Path(tc["out_dir"]) / mtype; out.mkdir(parents=True, exist_ok=True)
     results = []
     for r in range(1, tc["runs"] + 1):
         torch.manual_seed(tc["seed"] + r)
@@ -140,3 +143,135 @@ def train_unet(cfg):
 
     print(f"[unet] Best checkpoint -> {ckpt_path}")
     return str(ckpt_path)
+
+
+def _haversine(lat1, lon1, lat2, lon2):
+    """Great-circle distance in km between two (lat, lon) points in degrees."""
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
+         * math.sin(dlon / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def eval_cls(cfg, ckpt_path=None):
+    """Evaluate Timesformer + UNet: classification metrics + geographic distance.
+
+    For every true-positive patch, feeds the patch into UNet to get a pixel-level
+    heatmap, then computes haversine distance between the heatmap peak (predicted
+    genesis location) and the ground-truth hurricane mask centroid.
+    """
+    mc = cfg["model"]
+    dc = cfg["data"]
+    tc = cfg["train"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = build_model(cfg).to(device)
+    mtype = mc["type"]
+    if ckpt_path is None:
+        ckpt_path = str(Path(tc["out_dir"]) / mtype / "run_01" / "best.pt")
+    model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
+    model.eval()
+    print(f"[eval] Loaded {mtype} checkpoint: {ckpt_path}")
+
+    unet_ckpt = Path(cfg["unet"]["out_ckpt"])
+    if not unet_ckpt.exists():
+        raise FileNotFoundError(
+            f"UNet checkpoint not found: {unet_ckpt}\n"
+            "  Train UNet first: python run.py train --unet"
+        )
+    in_ch = mc["in_ch"] + 2
+    unet_model = UNet(in_ch=in_ch).to(device)
+    unet_model.load_state_dict(
+        torch.load(str(unet_ckpt), map_location=device, weights_only=True)
+    )
+    unet_model.eval()
+    print(f"[eval] Loaded UNet checkpoint: {unet_ckpt}")
+
+    cache = Path(dc["cache_dir"])
+    ph, pw = mc["patch"]
+    full_ds = PatchDataset(
+        str(cache / "region_env.npy"), str(cache / "region_hurr.npy"),
+        seq_len=mc["seq_len"], stride=tc["stride"],
+        patch_h=ph, patch_w=pw,
+    )
+    n_val = max(1, int(len(full_ds) * tc["val_split"]))
+    _, val_ds = random_split(
+        full_ds, [len(full_ds) - n_val, n_val],
+        generator=torch.Generator().manual_seed(tc["seed"]),
+    )
+    loader = DataLoader(val_ds, batch_size=tc["batch_size"], shuffle=False)
+
+    lat0 = dc["region"]["lat"][0]
+    lon0 = dc["region"]["lon"][0]
+
+    yy_pos = np.linspace(0, 1, ph)
+    xx_pos = np.linspace(0, 1, pw)
+    pos_grid = np.stack(np.meshgrid(xx_pos, yy_pos, indexing="ij"), axis=0)
+    pos_grid = pos_grid.transpose(0, 2, 1).astype(np.float32)
+
+    all_true, all_pred = [], []
+    dists = []
+
+    with torch.no_grad():
+        for x, y, y_patch, start_idx in tqdm(loader, desc="[eval]"):
+            logits = model(x.to(device))
+            pred = (torch.sigmoid(logits) > 0.5).long().cpu()
+
+            all_true.append(y.numpy().reshape(-1))
+            all_pred.append(pred.numpy().reshape(-1))
+
+            B, T, nh, nw = y.shape
+            for b in range(B):
+                for t in range(T):
+                    for i in range(nh):
+                        for j in range(nw):
+                            if y[b, t, i, j] != 1 or pred[b, t, i, j] != 1:
+                                continue
+                            mask = y_patch[b, t, i, j].numpy()
+                            if mask.sum() == 0:
+                                continue
+                            rows, cols = np.where(mask > 0)
+                            true_lat = 90.0 - (lat0 + i * ph + rows.mean())
+                            true_lon = float(lon0 + j * pw + cols.mean())
+
+                            env_patch = x[b, t, :,
+                                          i * ph:(i + 1) * ph,
+                                          j * pw:(j + 1) * pw].numpy()
+                            inp = np.concatenate([env_patch, pos_grid], axis=0)
+                            inp_t = torch.from_numpy(inp).unsqueeze(0).to(device)
+                            hm = torch.sigmoid(unet_model(inp_t)).cpu().numpy()[0]
+                            peak = np.unravel_index(hm.argmax(), hm.shape)
+                            pred_lat = 90.0 - (lat0 + i * ph + peak[0])
+                            pred_lon = float(lon0 + j * pw + peak[1])
+                            dists.append(
+                                _haversine(pred_lat, pred_lon, true_lat, true_lon)
+                            )
+
+    yt = np.concatenate(all_true)
+    yp = np.concatenate(all_pred)
+    acc, prec, rec, f1 = _metrics(yt, yp)
+    tp = int(((yt == 1) & (yp == 1)).sum())
+    fp = int(((yt == 0) & (yp == 1)).sum())
+    fn = int(((yt == 1) & (yp == 0)).sum())
+
+    print(f"\n{'='*50}")
+    print(f"[eval] Model: {mtype}")
+    print(f"{'='*50}")
+    print(f"  Accuracy:  {acc:.4f}")
+    print(f"  Precision: {prec:.4f}")
+    print(f"  Recall:    {rec:.4f}")
+    print(f"  F1:        {f1:.4f}")
+    print(f"  TP={tp}  FP={fp}  FN={fn}")
+
+    if dists:
+        d = np.array(dists)
+        print(f"\n[eval] UNet localization distance (TP patches, n={len(d)}):")
+        print(f"  Mean:   {d.mean():.1f} km")
+        print(f"  Median: {np.median(d):.1f} km")
+        print(f"  Std:    {d.std():.1f} km")
+        print(f"  Max:    {d.max():.1f} km")
+    else:
+        print("\n[eval] No true positives — cannot compute distance.")
