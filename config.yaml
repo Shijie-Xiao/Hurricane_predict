@@ -59,6 +59,12 @@ train:
   patience: 20                        # early stopping patience (0 = disabled)
   scheduler: cosine                   # "cosine" | "plateau" | null
 
+
+shap:
+  n_background: 200
+  n_explain: 150
+  out_dir: shap_outputs
+
 viz:
   saliency:
     ig_steps: 20

@@ -1,4 +1,4 @@
-"""Visualization: Integrated-Gradients saliency and PCMCI causal graphs."""
+"""Visualization: SHAP analysis, Integrated-Gradients saliency and PCMCI causal graphs."""
 
 import re
 from pathlib import Path
@@ -16,10 +16,13 @@ from scipy.ndimage import gaussian_filter
 from mpl_toolkits.basemap import Basemap
 
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 
-from models import build_model
-from dataset import PatchDataset
+import shap
+
+from models import build_model, UNet
+from dataset import PatchDataset, HeatmapDataset
 
 
 # -- geo helpers --------------------------------------------------------------
@@ -52,6 +55,180 @@ def _plot_map(path, data, title, bounds, grids, levels):
     fig.colorbar(cf, ax=ax, orientation="vertical", fraction=0.04, pad=0.02)
     fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
+
+
+# -- SHAP analysis ------------------------------------------------------------
+
+class _MeanScalarWrapper(nn.Module):
+    """Wrap any model that outputs (B, ...) into a scalar (B, 1) for SHAP."""
+
+    def __init__(self, base):
+        super().__init__()
+        self.base = base
+
+    def forward(self, x):
+        out = self.base(x)
+        return out.reshape(out.shape[0], -1).mean(dim=1, keepdim=True)
+
+
+def _pick_shap_samples(dataset, n_bg, n_ex, seed=0):
+    """Select background and explanation samples from a PyTorch Dataset.
+
+    Works for both PatchDataset (returns x,y,...) and HeatmapDataset (returns x,y).
+    Returns (bg_tensor, ex_tensor) with the input x stacked.
+    """
+    total = min(len(dataset), n_bg + n_ex)
+    n_bg = min(n_bg, total - 1)
+    n_ex = total - n_bg
+    rng = np.random.RandomState(seed)
+    indices = rng.choice(len(dataset), total, replace=False)
+
+    xs = []
+    for i in indices:
+        item = dataset[i]
+        xs.append(item[0])  # x tensor
+
+    stacked = torch.stack(xs)
+    return stacked[:n_bg], stacked[n_bg:]
+
+
+def shap_analysis(cfg, ckpt_path=None):
+    """Run SHAP GradientExplainer on both Timesformer and UNet.
+
+    Produces per-channel SHAP importance (beeswarm plot) and saves raw
+    SHAP values as .npy files.  Model structures are unchanged; only the
+    wrapper adds a mean-pooling layer so the output is scalar for SHAP.
+    """
+    sc = cfg["shap"]
+    mc = cfg["model"]
+    dc = cfg["data"]
+    tc = cfg["train"]
+    n_bg = sc["n_background"]
+    n_ex = sc["n_explain"]
+    out_dir = Path(sc["out_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    raw_ch = mc["in_ch"]          # 9 real ERA5 channels
+    channel_names = dc["channel_names"]
+    ph, pw = mc["patch"]
+    seed = tc["seed"]
+
+    cache = Path(dc["cache_dir"])
+    env_path = str(cache / "region_env.npy")
+    hurr_path = str(cache / "region_hurr.npy")
+
+    # ── Timesformer SHAP ─────────────────────────────────────────────
+    mtype = mc["type"]
+    model = build_model(cfg).to(device)
+    if ckpt_path is None:
+        ckpt_path = str(Path(tc["out_dir"]) / mtype / "run_01" / "best.pt")
+    model.load_state_dict(
+        torch.load(ckpt_path, map_location=device, weights_only=True)
+    )
+    model.eval()
+    print(f"[shap] Loaded Timesformer ({mtype}): {ckpt_path}")
+
+    tf_ds = PatchDataset(
+        env_path, hurr_path,
+        seq_len=mc["seq_len"], stride=tc["stride"],
+        patch_h=ph, patch_w=pw,
+    )
+    bg_tf, ex_tf = _pick_shap_samples(tf_ds, n_bg, n_ex, seed=seed)
+    # PatchDataset returns x as (T, C, H, W); model expects (B, T, C, H, W)
+    print(f"[shap] Timesformer background: {bg_tf.shape}, explain: {ex_tf.shape}")
+
+    wrapper_tf = _MeanScalarWrapper(model).to(device)
+    wrapper_tf.eval()
+
+    bg_dev = bg_tf.to(device)
+    ex_dev = ex_tf.to(device)
+    explainer_tf = shap.GradientExplainer(wrapper_tf, bg_dev)
+    sv_tf = explainer_tf.shap_values(ex_dev)
+    if isinstance(sv_tf, list):
+        sv_tf = sv_tf[0]
+    sv_tf = np.array(sv_tf)
+    if sv_tf.ndim == ex_tf.ndim + 1:
+        sv_tf = sv_tf.squeeze(-1)
+    print(f"[shap] Timesformer SHAP values shape: {sv_tf.shape}")
+
+    np.save(str(out_dir / "shap_timesformer.npy"), sv_tf)
+
+    # Channel aggregation: sv_tf is (B, T, C_total, H, W)
+    # Only take the first `raw_ch` channels (skip positional lat/lon)
+    sv_real = sv_tf[:, :, :raw_ch, :, :]  # (B, T, 9, H, W)
+    ex_real = ex_tf.numpy()[:, :, :raw_ch, :, :]
+
+    ch_shap_tf = np.abs(sv_real).mean(axis=(1, 3, 4))  # (B, 9)
+    ch_data_tf = ex_real.mean(axis=(1, 3, 4))           # (B, 9)
+
+    explanation_tf = shap.Explanation(
+        values=ch_shap_tf,
+        data=ch_data_tf,
+        feature_names=channel_names,
+    )
+    fig_tf = plt.figure()
+    shap.plots.beeswarm(explanation_tf, show=False)
+    fig_tf.savefig(str(out_dir / "shap_timesformer_beeswarm.png"),
+                   dpi=200, bbox_inches="tight")
+    plt.close(fig_tf)
+    print(f"[shap] Saved {out_dir / 'shap_timesformer_beeswarm.png'}")
+
+    # ── UNet SHAP ────────────────────────────────────────────────────
+    unet_ckpt = Path(cfg["unet"]["out_ckpt"])
+    if unet_ckpt.exists():
+        unet_in_ch = raw_ch + 2  # env + patch-level positional grid
+        unet_model = UNet(in_ch=unet_in_ch, ph=ph, pw=pw).to(device)
+        unet_model.load_state_dict(
+            torch.load(str(unet_ckpt), map_location=device, weights_only=True)
+        )
+        unet_model.eval()
+        print(f"[shap] Loaded UNet: {unet_ckpt}")
+
+        unet_ds = HeatmapDataset(
+            env_path, hurr_path, ph, pw,
+            sigma=cfg["unet"]["sigma"],
+        )
+        bg_un, ex_un = _pick_shap_samples(unet_ds, n_bg, n_ex, seed=seed)
+        print(f"[shap] UNet background: {bg_un.shape}, explain: {ex_un.shape}")
+
+        wrapper_un = _MeanScalarWrapper(unet_model).to(device)
+        wrapper_un.eval()
+
+        bg_un_dev = bg_un.to(device)
+        ex_un_dev = ex_un.to(device)
+        explainer_un = shap.GradientExplainer(wrapper_un, bg_un_dev)
+        sv_un = explainer_un.shap_values(ex_un_dev)
+        if isinstance(sv_un, list):
+            sv_un = sv_un[0]
+        sv_un = np.array(sv_un)
+        if sv_un.ndim == ex_un.ndim + 1:
+            sv_un = sv_un.squeeze(-1)
+        print(f"[shap] UNet SHAP values shape: {sv_un.shape}")
+
+        np.save(str(out_dir / "shap_unet.npy"), sv_un)
+
+        # UNet input is (C+2, ph, pw); only take first `raw_ch` channels
+        sv_un_real = sv_un[:, :raw_ch, :, :]
+        ex_un_real = ex_un.numpy()[:, :raw_ch, :, :]
+        ch_shap_un = np.abs(sv_un_real).mean(axis=(2, 3))  # (B, 9)
+        ch_data_un = ex_un_real.mean(axis=(2, 3))
+
+        explanation_un = shap.Explanation(
+            values=ch_shap_un,
+            data=ch_data_un,
+            feature_names=channel_names,
+        )
+        fig_un = plt.figure()
+        shap.plots.beeswarm(explanation_un, show=False)
+        fig_un.savefig(str(out_dir / "shap_unet_beeswarm.png"),
+                       dpi=200, bbox_inches="tight")
+        plt.close(fig_un)
+        print(f"[shap] Saved {out_dir / 'shap_unet_beeswarm.png'}")
+    else:
+        print(f"[shap] UNet checkpoint not found ({unet_ckpt}), skipping UNet SHAP.")
+
+    print("[shap] Done.")
 
 
 # -- Integrated Gradients saliency -------------------------------------------

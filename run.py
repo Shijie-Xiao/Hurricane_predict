@@ -2,12 +2,12 @@
 """
 Hurricane Genesis CLI – two automated pipelines.
 
-    python run.py predict     # prepare → train Patch → train UNet → eval
+    python run.py predict     # prepare → train Patch → train UNet → eval → SHAP
     python run.py visualize   # prepare → train Hier → saliency → PCMCI
 
 Individual steps are also available:
 
-    python run.py prepare / train / eval / saliency / pcmci
+    python run.py prepare / train / eval / shap / saliency / pcmci
 """
 
 import argparse
@@ -45,26 +45,29 @@ def load_cfg(path, overrides=None):
 # ── automated pipelines ──────────────────────────────────────────────
 
 def cmd_predict(args):
-    """Pipeline A: prepare → train PatchTimesformer → train UNet → eval."""
+    """Pipeline A: prepare → train PatchTimesformer → train UNet → eval → SHAP."""
     cfg = load_cfg(args.config, args.override)
     cfg["model"]["type"] = "patch"
 
     print("=" * 60)
-    print("[pipeline] PREDICT: prepare → train(patch) → train(unet) → eval")
+    print("[pipeline] PREDICT: prepare → train(patch) → train(unet) → eval → shap")
     print("=" * 60)
 
-    print("\n>>> Step 1/4: prepare data")
+    print("\n>>> Step 1/5: prepare data")
     dataset.prepare_data(cfg)
 
-    print("\n>>> Step 2/4: train PatchTimesformer")
+    print("\n>>> Step 2/5: train PatchTimesformer")
     results = train.train_cls(cfg)
     best_ckpt = max(results, key=lambda r: r[1])[0]
 
-    print("\n>>> Step 3/4: train UNet (sub-patch localization)")
+    print("\n>>> Step 3/5: train UNet (sub-patch localization)")
     train.train_unet(cfg)
 
-    print("\n>>> Step 4/4: evaluate (classification + geographic distance)")
+    print("\n>>> Step 4/5: evaluate (classification + geographic distance)")
     train.eval_cls(cfg, ckpt_path=best_ckpt)
+
+    print("\n>>> Step 5/5: SHAP analysis")
+    viz.shap_analysis(cfg, ckpt_path=best_ckpt)
 
     print("\n" + "=" * 60)
     print("[pipeline] PREDICT complete.")
@@ -124,6 +127,11 @@ def cmd_saliency(args):
     viz.saliency(cfg, ckpt_path=args.ckpt)
 
 
+def cmd_shap(args):
+    cfg = load_cfg(args.config, args.override)
+    viz.shap_analysis(cfg, ckpt_path=args.ckpt)
+
+
 def cmd_pcmci(args):
     cfg = load_cfg(args.config, args.override)
     viz.pcmci(cfg, saliency_dir=args.saliency_dir)
@@ -162,6 +170,10 @@ def main():
     sp.add_argument("--ckpt", default=None)
     _add_common(sp)
 
+    sp = sub.add_parser("shap", help="Run SHAP analysis on trained models")
+    sp.add_argument("--ckpt", default=None)
+    _add_common(sp)
+
     sp = sub.add_parser("saliency", help="Compute IG saliency maps")
     sp.add_argument("--ckpt", default=None)
     _add_common(sp)
@@ -174,7 +186,7 @@ def main():
     dispatch = {
         "predict": cmd_predict, "visualize": cmd_visualize,
         "prepare": cmd_prepare, "train": cmd_train, "eval": cmd_eval,
-        "saliency": cmd_saliency, "pcmci": cmd_pcmci,
+        "shap": cmd_shap, "saliency": cmd_saliency, "pcmci": cmd_pcmci,
     }
     dispatch[args.cmd](args)
 
