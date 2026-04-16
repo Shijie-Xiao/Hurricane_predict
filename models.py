@@ -53,6 +53,10 @@ class PatchTimesformer(nn.Module):
 
         nn.init.trunc_normal_(self.pos_s, std=0.02)
         nn.init.trunc_normal_(self.pos_t, std=0.02)
+        nn.init.trunc_normal_(self.proj.weight, std=0.02)
+        nn.init.zeros_(self.proj.bias)
+        nn.init.trunc_normal_(self.head.weight, std=0.02)
+        nn.init.zeros_(self.head.bias)
 
     def forward(self, x):
         """x: (B, T, C, H, W) -> logits (B, T, nh, nw)"""
@@ -100,6 +104,9 @@ class HierTimesformer(nn.Module):
 
         for p in (self.pos_s_s, self.pos_t_s, self.pos_s_l, self.pos_t_l):
             nn.init.trunc_normal_(p, std=0.02)
+        for lin in (self.proj_s, self.skip_proj, self.proj_l, self.head):
+            nn.init.trunc_normal_(lin.weight, std=0.02)
+            nn.init.zeros_(lin.bias)
 
     def forward(self, x):
         """x: (B, T, C, H, W) -> logits (B, T, nh, nw)"""
@@ -143,10 +150,17 @@ class _ConvStack(nn.Module):
 
 
 class UNet(nn.Module):
-    """U-Net with MLP bottleneck for patch-level heatmaps."""
+    """U-Net with MLP bottleneck for patch-level heatmaps.
 
-    def __init__(self, in_ch, out_ch=1):
+    Bottleneck spatial size is derived from (ph, pw): ph//4 x pw//4
+    after two 2x pooling stages.
+    """
+
+    def __init__(self, in_ch, ph, pw, out_ch=1):
         super().__init__()
+        bh, bw = ph // 4, pw // 4
+        self.bh, self.bw = bh, bw
+
         self.enc1 = _ConvStack(in_ch, 64)
         self.pool1 = nn.MaxPool2d(2)
         self.enc2 = nn.Sequential(
@@ -160,9 +174,10 @@ class UNet(nn.Module):
         self.drop2 = nn.Dropout(0.2)
         self.pool2 = nn.MaxPool2d(2)
 
-        self.fc1 = nn.Linear(5 * 5 * 256, 128)
+        flat = bh * bw * 256
+        self.fc1 = nn.Linear(flat, 128)
         self.fc2 = nn.Linear(128, 256)
-        self.fc3 = nn.Linear(256, 5 * 5 * 512)
+        self.fc3 = nn.Linear(256, bh * bw * 512)
 
         self.up1 = nn.ConvTranspose2d(512, 512, 2, stride=2)
         self.dec1 = nn.Sequential(
@@ -191,7 +206,8 @@ class UNet(nn.Module):
         c2 = self.drop2(self.enc2(p1))
         p2 = self.pool2(c2)
 
-        b = self.fc3(self.fc2(self.fc1(p2.flatten(1)))).view(-1, 512, 5, 5)
+        b = self.fc3(self.fc2(self.fc1(p2.flatten(1))))
+        b = b.view(-1, 512, self.bh, self.bw)
 
         d1 = self.dec1(torch.cat([self.up1(b), c2], 1))
         d2 = self.dec2(torch.cat([self.up2(d1), c1], 1))
@@ -199,11 +215,16 @@ class UNet(nn.Module):
 
 
 def build_model(cfg):
-    """Instantiate a Timesformer variant from config."""
+    """Instantiate a Timesformer variant from config.
+
+    in_ch from config is the raw ERA5 channel count (9); the dataset appends
+    2 positional channels (lat/lon), so models are built with in_ch + 2.
+    """
     m = cfg["model"]
     H, W = m["grid"]
     ph, pw = m["patch"]
-    shared = dict(seq_len=m["seq_len"], in_ch=m["in_ch"], H=H, W=W,
+    in_ch = m["in_ch"] + 2  # +2 for lat/lon positional channels from dataset
+    shared = dict(seq_len=m["seq_len"], in_ch=in_ch, H=H, W=W,
                   ph=ph, pw=pw, heads=m["num_heads"])
 
     if m["type"] == "patch":

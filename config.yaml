@@ -53,8 +53,11 @@ train:
   val_split: 0.1
   runs: 3
   seed: 1337
-  pos_weight: 10.0                    # set to e.g. 10.0 for class imbalance
+  pos_weight: 10.0                    # class imbalance correction (Demo default)
   out_dir: checkpoints
+  num_workers: 4                      # DataLoader worker processes
+  patience: 20                        # early stopping patience (0 = disabled)
+  scheduler: cosine                   # "cosine" | "plateau" | null
 
 viz:
   saliency:

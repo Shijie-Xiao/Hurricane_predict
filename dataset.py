@@ -93,6 +93,15 @@ class PatchDataset(Dataset):
         x = self.env[s : s + T].permute(0, 3, 1, 2)        # (T, C, H, W)
         h = self.hurr[s : s + T]                             # (T, H, W)
 
+        # append lat/lon positional channels (matching Demo's add_pos_embedding)
+        H, W = x.shape[2], x.shape[3]
+        lat = torch.linspace(-1, 1, H)
+        lon = torch.linspace(-1, 1, W)
+        mesh_lat, mesh_lon = torch.meshgrid(lat, lon, indexing="ij")
+        pos = torch.stack([mesh_lat, mesh_lon], dim=0)       # (2, H, W)
+        pos = pos.unsqueeze(0).expand(T, -1, -1, -1)         # (T, 2, H, W)
+        x = torch.cat([x, pos], dim=1)                       # (T, C+2, H, W)
+
         y_patch = (
             h.reshape(T, nl, ph, ml, pw).permute(0, 1, 3, 2, 4)
         )                                                     # (T, nl, ml, ph, pw)
@@ -185,8 +194,11 @@ def build_loaders(cfg, *, for_unet=False):
     train_ds, val_ds = random_split(
         ds, [n_train, n_val], generator=torch.Generator().manual_seed(seed)
     )
-    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, drop_last=False)
-    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, drop_last=False)
+    nw = cfg["train"].get("num_workers", 0)
+    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,
+                              drop_last=False, num_workers=nw, pin_memory=nw > 0)
+    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False,
+                            drop_last=False, num_workers=nw, pin_memory=nw > 0)
     print(f"[data] {'UNet' if for_unet else 'Timesformer'}: "
           f"train={n_train}, val={n_val}, batch={bs}")
     return train_loader, val_loader

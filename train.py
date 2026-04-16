@@ -25,6 +25,17 @@ def _metrics(y_true, y_pred):
     return acc, prec, rec, f1
 
 
+def _build_scheduler(opt, cfg):
+    """Build LR scheduler from config.  Returns scheduler or None."""
+    tc = cfg["train"]
+    kind = tc.get("scheduler")
+    if kind == "cosine":
+        return optim.lr_scheduler.CosineAnnealingLR(opt, T_max=tc["epochs"])
+    if kind == "plateau":
+        return optim.lr_scheduler.ReduceLROnPlateau(opt, patience=5, factor=0.5)
+    return None
+
+
 def _run_one(run_dir, model, device, train_loader, val_loader, cfg):
     tc = cfg["train"]
     pw = tc.get("pos_weight")
@@ -33,8 +44,12 @@ def _run_one(run_dir, model, device, train_loader, val_loader, cfg):
     else:
         crit = nn.BCEWithLogitsLoss()
     opt = optim.AdamW(model.parameters(), lr=tc["lr"], weight_decay=tc["weight_decay"])
+    sched = _build_scheduler(opt, cfg)
+    patience = tc.get("patience", 0)
 
     best_f1, best_path = -1.0, run_dir / "best.pt"
+    wait = 0
+
     for ep in range(1, tc["epochs"] + 1):
         model.train()
         loss_sum, yt, yp = 0.0, [], []
@@ -62,13 +77,27 @@ def _run_one(run_dir, model, device, train_loader, val_loader, cfg):
         va = _metrics(np.array(yvt), np.array(yvp))
         n_tr = len(train_loader.dataset)
         n_va = len(val_loader.dataset)
-        print(f"Ep{ep:03d} | TrLoss {loss_sum/n_tr:.4f} F1 {tr[3]:.4f} | "
+        lr_now = opt.param_groups[0]["lr"]
+        print(f"Ep{ep:03d} | lr={lr_now:.2e} | TrLoss {loss_sum/n_tr:.4f} F1 {tr[3]:.4f} | "
               f"VaLoss {vloss/n_va:.4f} F1 {va[3]:.4f}")
+
+        if sched is not None:
+            if isinstance(sched, optim.lr_scheduler.ReduceLROnPlateau):
+                sched.step(vloss / n_va)
+            else:
+                sched.step()
 
         if va[3] > best_f1:
             best_f1 = va[3]
+            wait = 0
             torch.save(model.state_dict(), best_path)
             print(f"  -> Saved {best_path} (F1={best_f1:.4f})")
+        else:
+            wait += 1
+            if patience > 0 and wait >= patience:
+                print(f"  -> Early stopping at epoch {ep} "
+                      f"(no improvement for {patience} epochs)")
+                break
 
     return best_path, best_f1
 
@@ -99,6 +128,7 @@ def train_cls(cfg):
 def train_unet(cfg):
     """Train UNet heatmap model."""
     uc = cfg["unet"]
+    mc = cfg["model"]
     seed = cfg["train"]["seed"]
     torch.manual_seed(seed); np.random.seed(seed)
 
@@ -107,7 +137,8 @@ def train_unet(cfg):
 
     sample_x, _ = next(iter(train_loader))
     in_ch = sample_x.shape[1]
-    model = UNet(in_ch=in_ch).to(device)
+    ph, pw = mc["patch"]
+    model = UNet(in_ch=in_ch, ph=ph, pw=pw).to(device)
     crit = nn.BCEWithLogitsLoss()
     opt = optim.Adam(model.parameters(), lr=uc["lr"])
     sched = optim.lr_scheduler.ReduceLROnPlateau(opt, patience=3, factor=0.5)
@@ -176,14 +207,16 @@ def eval_cls(cfg, ckpt_path=None):
     model.eval()
     print(f"[eval] Loaded {mtype} checkpoint: {ckpt_path}")
 
+    ph, pw = mc["patch"]
+    raw_ch = mc["in_ch"]  # 9 raw ERA5 channels (without lat/lon pos channels)
     unet_ckpt = Path(cfg["unet"]["out_ckpt"])
     if not unet_ckpt.exists():
         raise FileNotFoundError(
             f"UNet checkpoint not found: {unet_ckpt}\n"
             "  Train UNet first: python run.py train --unet"
         )
-    in_ch = mc["in_ch"] + 2
-    unet_model = UNet(in_ch=in_ch).to(device)
+    unet_in_ch = raw_ch + 2  # raw env + patch-level positional grid
+    unet_model = UNet(in_ch=unet_in_ch, ph=ph, pw=pw).to(device)
     unet_model.load_state_dict(
         torch.load(str(unet_ckpt), map_location=device, weights_only=True)
     )
@@ -191,7 +224,6 @@ def eval_cls(cfg, ckpt_path=None):
     print(f"[eval] Loaded UNet checkpoint: {unet_ckpt}")
 
     cache = Path(dc["cache_dir"])
-    ph, pw = mc["patch"]
     full_ds = PatchDataset(
         str(cache / "region_env.npy"), str(cache / "region_hurr.npy"),
         seq_len=mc["seq_len"], stride=tc["stride"],
@@ -202,7 +234,9 @@ def eval_cls(cfg, ckpt_path=None):
         full_ds, [len(full_ds) - n_val, n_val],
         generator=torch.Generator().manual_seed(tc["seed"]),
     )
-    loader = DataLoader(val_ds, batch_size=tc["batch_size"], shuffle=False)
+    nw = tc.get("num_workers", 0)
+    loader = DataLoader(val_ds, batch_size=tc["batch_size"], shuffle=False,
+                        num_workers=nw, pin_memory=nw > 0)
 
     lat0 = dc["region"]["lat"][0]
     lon0 = dc["region"]["lon"][0]
@@ -237,7 +271,7 @@ def eval_cls(cfg, ckpt_path=None):
                             true_lat = 90.0 - (lat0 + i * ph + rows.mean())
                             true_lon = float(lon0 + j * pw + cols.mean())
 
-                            env_patch = x[b, t, :,
+                            env_patch = x[b, t, :raw_ch,
                                           i * ph:(i + 1) * ph,
                                           j * pw:(j + 1) * pw].numpy()
                             inp = np.concatenate([env_patch, pos_grid], axis=0)
